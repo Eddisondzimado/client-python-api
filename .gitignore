@@ -1,0 +1,5 @@
+# Google credentials
+google_credentials.json
+*.json
+gdrive_service_account.json
+.env
