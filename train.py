@@ -47,19 +47,21 @@ DB_CONFIG = {
 }
 
 # Google Drive Configuration
+GOOGLE_DRIVE_ENABLED = False
+gdrive_manager = None
+
 try:
     from gdrive_utils import gdrive_manager
-    GOOGLE_DRIVE_ENABLED = gdrive_manager is not None
-    if GOOGLE_DRIVE_ENABLED:
+    if gdrive_manager is not None:
+        GOOGLE_DRIVE_ENABLED = True
         logger.info("Google Drive integration enabled")
     else:
-        logger.warning("Google Drive integration disabled - initialization failed")
-except ImportError:
-    GOOGLE_DRIVE_ENABLED = False
-    logger.warning("Google Drive integration disabled - gdrive_utils not found")
+        logger.warning("Google Drive integration disabled - gdrive_manager is None")
+except ImportError as e:
+    logger.warning(f"Google Drive integration disabled - gdrive_utils not found: {e}")
 except Exception as e:
-    GOOGLE_DRIVE_ENABLED = False
     logger.warning(f"Google Drive integration disabled - initialization error: {e}")
+    
 def clean_text(text):
     """Basic text cleaning"""
     return text.lower().strip()
