@@ -18,8 +18,17 @@ import argparse
 import sys
 import time
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+import logging
+
+# Configure logging more thoroughly
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('training.log')
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # Set seeds for reproducibility
@@ -188,24 +197,62 @@ def balanced_train_test_split(X, y, test_size=0.2, min_samples=2):
     
     return X[train_indices], X[val_indices], y[train_indices], y[val_indices]
 
+
 def upload_to_google_drive(client_id, model_path, tokenizer_path, labels_path):
-    """Upload model files to Google Drive"""
+    """Upload model files to Google Drive with detailed logging"""
     if not GOOGLE_DRIVE_ENABLED:
         logger.warning("Google Drive not enabled, skipping upload")
         return False
     
     try:
         prefix = "global" if not client_id else f"client_{client_id}"
+        logger.info(f"Starting Google Drive upload for {prefix}")
         
-        # Upload model files
-        gdrive_manager.upload_file(model_path, f"{prefix}_model.keras")
-        gdrive_manager.upload_file(tokenizer_path, f"{prefix}_tokenizer.pkl")
-        gdrive_manager.upload_file(labels_path, f"{prefix}_labels.pkl")
+        # Check if files exist locally
+        for path, name in [
+            (model_path, "model"),
+            (tokenizer_path, "tokenizer"), 
+            (labels_path, "labels")
+        ]:
+            if not os.path.exists(path):
+                logger.error(f"Local {name} file not found: {path}")
+                return False
         
-        logger.info("Model files uploaded to Google Drive successfully")
-        return True
+        # Upload files
+        upload_results = []
+        
+        # Upload model
+        model_remote_name = f"{prefix}_model.keras"
+        model_id = gdrive_manager.upload_file(model_path, model_remote_name)
+        upload_results.append(("model", model_id))
+        
+        # Upload tokenizer
+        tokenizer_remote_name = f"{prefix}_tokenizer.pkl"
+        tokenizer_id = gdrive_manager.upload_file(tokenizer_path, tokenizer_remote_name)
+        upload_results.append(("tokenizer", tokenizer_id))
+        
+        # Upload labels
+        labels_remote_name = f"{prefix}_labels.pkl"
+        labels_id = gdrive_manager.upload_file(labels_path, labels_remote_name)
+        upload_results.append(("labels", labels_id))
+        
+        # Check if all uploads were successful
+        success = all(result[1] is not None for result in upload_results)
+        
+        if success:
+            logger.info("All model files uploaded to Google Drive successfully")
+            for file_type, file_id in upload_results:
+                logger.info(f"{file_type.capitalize()} uploaded with ID: {file_id}")
+        else:
+            logger.error("Some files failed to upload to Google Drive")
+            for file_type, file_id in upload_results:
+                status = "✓" if file_id else "✗"
+                logger.info(f"{status} {file_type}: {file_id or 'FAILED'}")
+        
+        return success
+        
     except Exception as e:
-        logger.error(f"Failed to upload to Google Drive: {e}")
+        logger.error(f"Failed to upload to Google Drive: {e}", exc_info=True)
         return False
 
 def train_model(client_id=None):
