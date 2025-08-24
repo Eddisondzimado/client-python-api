@@ -18,6 +18,11 @@ from datetime import datetime
 import sys
 import functools
 from typing import Dict, Tuple
+import io
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.errors import HttpError
 
 # Configure logging
 logging.basicConfig(
@@ -43,18 +48,108 @@ CORS(app)
 GOOGLE_DRIVE_ENABLED = False
 gdrive_manager = None
 
-try:
-    from gdrive_utils import gdrive_manager
-    if gdrive_manager is not None:
-        GOOGLE_DRIVE_ENABLED = True
-        logger.info("Google Drive integration enabled")
-    else:
-        logger.warning("Google Drive integration disabled - gdrive_manager is None")
-except ImportError as e:
-    logger.warning(f"Google Drive integration disabled - gdrive_utils not found: {e}")
-except Exception as e:
-    logger.warning(f"Google Drive integration disabled - initialization error: {e}")
+# Google Drive Manager class
+class GoogleDriveManager:
+    def __init__(self):
+        try:
+            logger.info("Initializing Google Drive manager...")
+            
+            # Get credentials from environment variable
+            creds_json = os.environ.get('GOOGLE_DRIVE_CREDENTIALS')
+            logger.info(f"GOOGLE_DRIVE_CREDENTIALS found: {bool(creds_json)}")
+            
+            if not creds_json:
+                raise ValueError("GOOGLE_DRIVE_CREDENTIALS environment variable not set")
+            
+            # Get folder ID from environment variable
+            self.folder_id = os.environ.get('GOOGLE_DRIVE_FOLDER_ID')
+            logger.info(f"GOOGLE_DRIVE_FOLDER_ID found: {bool(self.folder_id)}")
+            
+            if not self.folder_id:
+                raise ValueError("GOOGLE_DRIVE_FOLDER_ID environment variable not set")
+            
+            # Parse the JSON from environment variable
+            self.credentials_info = json.loads(creds_json)
+            
+            # Create credentials
+            self.credentials = service_account.Credentials.from_service_account_info(
+                self.credentials_info,
+                scopes=['https://www.googleapis.com/auth/drive']
+            )
+            
+            # Build the service
+            self.service = build('drive', 'v3', credentials=self.credentials)
+            
+            logger.info("Google Drive manager initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize Google Drive manager: {e}")
+            raise
     
+    def upload_file(self, local_path, remote_name, mime_type='application/octet-stream'):
+        """Upload a file to Google Drive"""
+        try:
+            file_metadata = {
+                'name': remote_name,
+                'parents': [self.folder_id]
+            }
+            
+            media = MediaFileUpload(local_path, mimetype=mime_type)
+            file = self.service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id'
+            ).execute()
+            
+            logger.info(f"Uploaded {remote_name} to Google Drive with ID: {file.get('id')}")
+            return file.get('id')
+            
+        except Exception as e:
+            logger.error(f"Failed to upload {remote_name} to Google Drive: {e}")
+            return None
+
+    def download_file(self, remote_name, local_path):
+        """Download a file from Google Drive"""
+        try:
+            # Search for the file
+            query = f"name='{remote_name}' and '{self.folder_id}' in parents and trashed=false"
+            results = self.service.files().list(q=query, fields="files(id, name)").execute()
+            files = results.get('files', [])
+            
+            if not files:
+                raise FileNotFoundError(f"File {remote_name} not found in Google Drive")
+            
+            file_id = files[0]['id']
+            
+            # Download the file
+            request = self.service.files().get_media(fileId=file_id)
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while done is False:
+                status, done = downloader.next_chunk()
+            
+            # Save to local file
+            with open(local_path, 'wb') as f:
+                f.write(fh.getvalue())
+            
+            logger.info(f"Downloaded {remote_name} from Google Drive to {local_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to download {remote_name} from Google Drive: {e}")
+            return False
+
+# Initialize Google Drive manager
+try:
+    gdrive_manager = GoogleDriveManager()
+    GOOGLE_DRIVE_ENABLED = True
+    logger.info("Google Drive integration enabled")
+except Exception as e:
+    gdrive_manager = None
+    GOOGLE_DRIVE_ENABLED = False
+    logger.warning(f"Google Drive integration disabled: {e}")
+
 class Config:
     """Application configuration"""
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -296,37 +391,6 @@ def _run_training(client_id, training_id):
     finally:
         training_in_progress = False
 
-# Add cache management endpoint
-@app.route("/cache/clear", methods=["POST"])
-def clear_cache():
-    """Clear model cache"""
-    try:
-        ModelCache.clear()
-        return jsonify({
-            "status": "success",
-            "message": "Model cache cleared",
-            "cache_size": 0
-        })
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
-
-@app.route("/cache/status", methods=["GET"])
-def cache_status():
-    """Get cache status"""
-    try:
-        return jsonify({
-            "status": "success",
-            "cache_size": len(ModelCache._cache),
-            "cached_models": list(ModelCache._cache.keys())
-        })
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
 
 
 def get_response(intent, client_id=None):
@@ -680,6 +744,41 @@ def health_check():
         return jsonify({
             "status": "error",
             "error": str(e)
+        }), 500
+
+@app.route("/debug/google-drive", methods=["GET"])
+def debug_google_drive():
+    """Debug endpoint to check Google Drive status"""
+    try:
+        # Check if environment variables are set
+        creds_set = bool(os.environ.get('GOOGLE_DRIVE_CREDENTIALS'))
+        folder_id_set = bool(os.environ.get('GOOGLE_DRIVE_FOLDER_ID'))
+        
+        # Try to initialize Google Drive manager to get detailed error
+        try:
+            test_manager = GoogleDriveManager()
+            drive_status = "initialized_successfully"
+            folder_id = test_manager.folder_id
+        except Exception as e:
+            drive_status = f"initialization_failed: {str(e)}"
+            folder_id = None
+        
+        return jsonify({
+            "status": "success",
+            "environment_variables": {
+                "GOOGLE_DRIVE_CREDENTIALS_set": creds_set,
+                "GOOGLE_DRIVE_FOLDER_ID_set": folder_id_set,
+                "GOOGLE_DRIVE_FOLDER_ID_value": os.environ.get('GOOGLE_DRIVE_FOLDER_ID')
+            },
+            "google_drive_status": drive_status,
+            "folder_id": folder_id,
+            "gdrive_manager_global": "initialized" if gdrive_manager is not None else "failed"
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
         }), 500
 
 if __name__ == "__main__":
