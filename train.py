@@ -17,8 +17,11 @@ import logging
 import argparse
 import sys
 import time
-
-import logging
+import io
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.errors import HttpError
 
 # Configure logging more thoroughly
 logging.basicConfig(
@@ -50,16 +53,86 @@ DB_CONFIG = {
 GOOGLE_DRIVE_ENABLED = False
 gdrive_manager = None
 
+# Google Drive Manager class (in case gdrive_utils is not available)
+class GoogleDriveManager:
+    def __init__(self):
+        try:
+            logger.info("Initializing Google Drive manager...")
+            
+            # Get credentials from environment variable
+            creds_json = os.environ.get('GOOGLE_DRIVE_CREDENTIALS')
+            logger.info(f"GOOGLE_DRIVE_CREDENTIALS found: {bool(creds_json)}")
+            
+            if not creds_json:
+                raise ValueError("GOOGLE_DRIVE_CREDENTIALS environment variable not set")
+            
+            # Get folder ID from environment variable
+            self.folder_id = os.environ.get('GOOGLE_DRIVE_FOLDER_ID')
+            logger.info(f"GOOGLE_DRIVE_FOLDER_ID found: {bool(self.folder_id)}")
+            
+            if not self.folder_id:
+                raise ValueError("GOOGLE_DRIVE_FOLDER_ID environment variable not set")
+            
+            # Parse the JSON from environment variable
+            self.credentials_info = json.loads(creds_json)
+            
+            # Create credentials
+            self.credentials = service_account.Credentials.from_service_account_info(
+                self.credentials_info,
+                scopes=['https://www.googleapis.com/auth/drive']
+            )
+            
+            # Build the service
+            self.service = build('drive', 'v3', credentials=self.credentials)
+            
+            logger.info("Google Drive manager initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize Google Drive manager: {e}")
+            raise
+    
+    def upload_file(self, local_path, remote_name, mime_type='application/octet-stream'):
+        """Upload a file to Google Drive"""
+        try:
+            file_metadata = {
+                'name': remote_name,
+                'parents': [self.folder_id]
+            }
+            
+            media = MediaFileUpload(local_path, mimetype=mime_type)
+            file = self.service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id'
+            ).execute()
+            
+            logger.info(f"Uploaded {remote_name} to Google Drive with ID: {file.get('id')}")
+            return file.get('id')
+            
+        except Exception as e:
+            logger.error(f"Failed to upload {remote_name} to Google Drive: {e}")
+            return None
+
+# Try to import from gdrive_utils, fall back to local class
 try:
     from gdrive_utils import gdrive_manager
     if gdrive_manager is not None:
         GOOGLE_DRIVE_ENABLED = True
-        logger.info("Google Drive integration enabled")
+        logger.info("Google Drive integration enabled (from gdrive_utils)")
     else:
         logger.warning("Google Drive integration disabled - gdrive_manager is None")
 except ImportError as e:
-    logger.warning(f"Google Drive integration disabled - gdrive_utils not found: {e}")
+    # Fall back to local implementation
+    try:
+        gdrive_manager = GoogleDriveManager()
+        GOOGLE_DRIVE_ENABLED = True
+        logger.info("Google Drive integration enabled (local implementation)")
+    except Exception as init_error:
+        gdrive_manager = None
+        GOOGLE_DRIVE_ENABLED = False
+        logger.warning(f"Google Drive integration disabled: {init_error}")
 except Exception as e:
+    GOOGLE_DRIVE_ENABLED = False
     logger.warning(f"Google Drive integration disabled - initialization error: {e}")
     
 def clean_text(text):
