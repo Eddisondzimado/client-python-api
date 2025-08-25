@@ -43,10 +43,12 @@ GOOGLE_DRIVE_ENABLED = False
 gdrive_manager = None
 
 # Try to import Google Drive dependencies
+
+# Try to import Google Drive dependencies
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseDownload
+    from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload  # ADD MediaFileUpload
     
     class GoogleDriveManager:
         def __init__(self):
@@ -72,31 +74,32 @@ try:
                 logger.error(f"Failed to initialize Google Drive: {e}")
                 raise
         
-        def download_file(self, remote_name, local_path):
-            """Download a file from Google Drive"""
+        def upload_file(self, local_path, remote_name):
+            """Upload a file to Google Drive"""
             try:
-                query = f"name='{remote_name}' and '{self.folder_id}' in parents and trashed=false"
-                results = self.service.files().list(q=query, fields="files(id, name)").execute()
-                files = results.get('files', [])
+                if not os.path.exists(local_path):
+                    logger.error(f"Local file not found: {local_path}")
+                    return None
                 
-                if not files:
-                    raise FileNotFoundError(f"File {remote_name} not found")
+                file_metadata = {
+                    'name': remote_name,
+                    'parents': [self.folder_id]
+                }
                 
-                file_id = files[0]['id']
-                request = self.service.files().get_media(fileId=file_id)
+                media = MediaFileUpload(local_path)  # This requires MediaFileUpload import
+                file = self.service.files().create(
+                    body=file_metadata,
+                    media_body=media,
+                    fields='id'
+                ).execute()
                 
-                with open(local_path, 'wb') as f:
-                    downloader = MediaIoBaseDownload(f, request)
-                    done = False
-                    while not done:
-                        _, done = downloader.next_chunk()
-                
-                logger.info(f"Downloaded {remote_name}")
-                return True
+                file_id = file.get('id')
+                logger.info(f"Uploaded {remote_name} to Google Drive with ID: {file_id}")
+                return file_id
                 
             except Exception as e:
-                logger.error(f"Failed to download {remote_name}: {e}")
-                return False
+                logger.error(f"Failed to upload {remote_name}: {e}")
+                return None
 
         def file_exists(self, remote_name):
             """Check if a file exists on Google Drive"""
@@ -194,6 +197,7 @@ def download_from_google_drive(client_id):
             ("tokenizer", f"{prefix}_tokenizer.pkl"),
             ("labels", f"{prefix}_labels.pkl")
         ]:
+            # FIXED: Changed download_file to download_file (singular)
             if not gdrive_manager.download_file(remote_name, model_files[file_type]):
                 success = False
         
@@ -201,7 +205,6 @@ def download_from_google_drive(client_id):
     except Exception as e:
         logger.error(f"Download failed: {e}")
         return False
-
 def load_model_from_disk(client_id):
     """Load model from disk files"""
     try:
