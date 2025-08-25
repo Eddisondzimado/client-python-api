@@ -530,9 +530,19 @@ def check_training_status():
     with training_lock:
         return jsonify({
             "status": "success" if not training_in_progress else "running",
-            "message": "Training completed successfully" if not training_in_progress else "Training in progress"
+            "message": "Training completed successfully" if not training_in_progress else "Training in progress",
+            "training_in_progress": training_in_progress
         })
 
+@app.route("/training-complete", methods=["GET"])
+def check_training_complete():
+    """Check if training is complete - alias for /training-status"""
+    with training_lock:
+        return jsonify({
+            "status": "success" if not training_in_progress else "running",
+            "message": "Training completed successfully" if not training_in_progress else "Training in progress",
+            "training_in_progress": training_in_progress
+        })
 @app.route("/check-models", methods=["GET"])
 def check_models():
     """Model verification endpoint"""
