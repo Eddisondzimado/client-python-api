@@ -11,7 +11,7 @@ from tensorflow.keras.preprocessing.sequence import pad_sequences
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
-from collections import Counter
+from collections import defaultdict, Counter  # Fixed import
 import mysql.connector
 import logging
 import argparse
@@ -98,7 +98,7 @@ class GoogleDriveManager:
             ).execute()
             
             file_id = file.get('id')
-            logger.info(f"Uploaded {remote_name} to Google Drive")
+            logger.info(f"Uploaded {remote_name} to Google Drive with ID: {file_id}")
             return file_id
             
         except Exception as e:
@@ -142,8 +142,14 @@ def get_db_connection():
 
 def augment_patterns(patterns):
     """Generate variations of patterns for data augmentation"""
+    if not patterns:
+        return []
+        
     augmented = set(patterns)
     for pattern in patterns:
+        if not pattern or not isinstance(pattern, str):
+            continue
+            
         if '?' in pattern:
             augmented.add(pattern.replace('?', ''))
             augmented.add(pattern + ' please')
@@ -167,11 +173,11 @@ def load_training_data(client_id=None):
         query = """
             SELECT tag, patterns, responses 
             FROM chatbot_intents 
-            WHERE user_token = %s OR %s IS NULL
+            WHERE (user_token = %s OR %s IS NULL) AND patterns IS NOT NULL AND responses IS NOT NULL
         """ if client_id else """
             SELECT tag, patterns, responses 
             FROM chatbot_intents 
-            WHERE user_token IS NULL
+            WHERE user_token IS NULL AND patterns IS NOT NULL AND responses IS NOT NULL
         """
         
         with conn.cursor(dictionary=True) as cursor:
@@ -185,7 +191,10 @@ def load_training_data(client_id=None):
             intents = []
             for row in rows:
                 try:
-                    patterns = [clean_text(p) for p in json.loads(row["patterns"]) if p.strip()]
+                    if not row["patterns"] or not row["responses"]:
+                        continue
+                        
+                    patterns = [clean_text(p) for p in json.loads(row["patterns"]) if p and p.strip()]
                     responses = json.loads(row["responses"])
                     
                     if len(patterns) >= 1:
@@ -195,10 +204,14 @@ def load_training_data(client_id=None):
                             "patterns": augmented_patterns,
                             "responses": responses
                         })
+                    else:
+                        logger.warning(f"Skipping intent '{row['tag']}' with no valid patterns")
                 except json.JSONDecodeError as e:
                     logger.error(f"JSON decode error for intent {row['tag']}: {e}")
+                except Exception as e:
+                    logger.error(f"Error processing intent {row['tag']}: {e}")
             
-            logger.info(f"Loaded {len(intents)} intents")
+            logger.info(f"Loaded {len(intents)} intents with {sum(len(i['patterns']) for i in intents)} total patterns")
             return {"intents": intents} if intents else None
             
     except Exception as e:
@@ -230,8 +243,6 @@ def build_optimized_model(vocab_size, num_classes, max_sequence_length):
 
 def balanced_train_test_split(X, y, test_size=0.2, min_samples=2):
     """Custom train-test split for imbalanced classes"""
-    from collections import defaultdict
-    
     class_indices = defaultdict(list)
     for i, label in enumerate(y):
         class_indices[label].append(i)
@@ -269,12 +280,17 @@ def upload_to_google_drive(client_id, model_path, tokenizer_path, labels_path):
         ]
         
         for local_path, remote_name in files_to_upload:
-            file_id = gdrive_manager.upload_file(local_path, remote_name)
-            upload_results.append(file_id is not None)
+            # Check if file already exists on Google Drive
+            if gdrive_manager.file_exists(remote_name):
+                logger.info(f"File {remote_name} already exists on Google Drive, skipping upload")
+                upload_results.append(True)
+            else:
+                file_id = gdrive_manager.upload_file(local_path, remote_name)
+                upload_results.append(file_id is not None)
         
         success = all(upload_results)
         if success:
-            logger.info("All files uploaded to Google Drive")
+            logger.info("All files processed on Google Drive")
         else:
             logger.error("Some files failed to upload")
         
@@ -290,6 +306,7 @@ def train_model(client_id=None):
         # Load data
         data = load_training_data(client_id)
         if not data:
+            logger.error("No training data available")
             return False
 
         # Prepare text data
@@ -300,11 +317,16 @@ def train_model(client_id=None):
 
         logger.info(f"Training samples: {len(texts)}")
         
+        if len(texts) == 0:
+            logger.error("No valid training texts found")
+            return False
+            
         # Tokenize text
-        tokenizer = Tokenizer(oov_token="<OOV>")
+        tokenizer = Tokenizer(oov_token="<OOV>", filters='')
         tokenizer.fit_on_texts(texts)
         sequences = tokenizer.texts_to_sequences(texts)
         max_len = max(len(seq) for seq in sequences) if sequences else 20
+        max_len = min(max_len, 100)  # Cap sequence length to prevent memory issues
         padded = pad_sequences(sequences, maxlen=max_len, padding='post')
 
         # Encode labels
@@ -318,7 +340,9 @@ def train_model(client_id=None):
         try:
             class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
             class_weight_dict = dict(enumerate(class_weights))
-        except ValueError:
+            logger.info(f"Class weights computed: {class_weight_dict}")
+        except ValueError as e:
+            logger.warning(f"Could not compute class weights: {e}")
             class_weight_dict = None
 
         # Build and train model
@@ -326,18 +350,22 @@ def train_model(client_id=None):
 
         # Adjust batch size for memory optimization
         batch_size = min(16, max(4, len(X_train) // 20))
+        if len(X_train) < batch_size:
+            batch_size = max(1, len(X_train))
         
-        model.fit(
+        logger.info(f"Training configuration: batch_size={batch_size}, samples={len(X_train)}")
+        
+        history = model.fit(
             X_train, y_train,
             validation_data=(X_val, y_val) if len(X_val) > 0 else None,
-            epochs=50,  # Reduced epochs
+            epochs=50,
             batch_size=batch_size,
             class_weight=class_weight_dict,
             callbacks=[
                 tf.keras.callbacks.EarlyStopping(patience=8, restore_best_weights=True),
                 tf.keras.callbacks.ReduceLROnPlateau(factor=0.2, patience=4)
             ],
-            verbose=1  # Reduced verbosity
+            verbose=1
         )
 
         # Save model
@@ -351,12 +379,15 @@ def train_model(client_id=None):
         # Save files
         model.save(model_path, save_format='tf')
         with open(tokenizer_path, "wb") as f:
-            pickle.dump(tokenizer, f, protocol=4)  # Protocol 4 for compatibility
+            pickle.dump(tokenizer, f, protocol=4)
         with open(labels_path, "wb") as f:
             pickle.dump(label_encoder.classes_, f, protocol=4)
 
         # Upload to Google Drive
-        upload_to_google_drive(client_id, model_path, tokenizer_path, labels_path)
+        upload_success = upload_to_google_drive(client_id, model_path, tokenizer_path, labels_path)
+        
+        if not upload_success:
+            logger.warning("Google Drive upload failed, but local files saved")
 
         # Clean up memory
         del model, tokenizer, label_encoder, X_train, X_val, y_train, y_val
@@ -367,13 +398,20 @@ def train_model(client_id=None):
 
     except Exception as e:
         logger.error(f"Training failed: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return False
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--client-id", type=str, default=None)
+    parser = argparse.ArgumentParser(description="Train chatbot model")
+    parser.add_argument("--client-id", type=str, default=None, help="Client ID for specific training")
     args = parser.parse_args()
 
+    logger.info(f"Starting training for client: {args.client_id or 'global'}")
+    
     if not train_model(client_id=args.client_id):
+        logger.error("Training failed")
         sys.exit(1)
+    
+    logger.info("Training completed successfully")
     sys.exit(0)
