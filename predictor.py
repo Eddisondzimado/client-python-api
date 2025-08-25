@@ -12,10 +12,7 @@ import logging
 import time
 from datetime import datetime
 import gc
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
-import io
+import threading  # Added missing import
 
 # Configure logging
 logging.basicConfig(
@@ -35,74 +32,78 @@ tf.get_logger().setLevel('ERROR')
 app = Flask(__name__)
 CORS(app)
 
-class GoogleDriveManager:
-    def __init__(self):
-        try:
-            creds_json = os.environ.get('GOOGLE_DRIVE_CREDENTIALS')
-            if not creds_json:
-                raise ValueError("GOOGLE_DRIVE_CREDENTIALS not set")
-            
-            self.folder_id = os.environ.get('GOOGLE_DRIVE_FOLDER_ID')
-            if not self.folder_id:
-                raise ValueError("GOOGLE_DRIVE_FOLDER_ID not set")
-            
-            self.credentials_info = json.loads(creds_json)
-            self.credentials = service_account.Credentials.from_service_account_info(
-                self.credentials_info,
-                scopes=['https://www.googleapis.com/auth/drive']
-            )
-            
-            self.service = build('drive', 'v3', credentials=self.credentials)
-            logger.info("Google Drive manager initialized")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize Google Drive: {e}")
-            raise
-    
-    def download_file(self, remote_name, local_path):
-        """Download a file from Google Drive"""
-        try:
-            query = f"name='{remote_name}' and '{self.folder_id}' in parents and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id, name)").execute()
-            files = results.get('files', [])
-            
-            if not files:
-                raise FileNotFoundError(f"File {remote_name} not found")
-            
-            file_id = files[0]['id']
-            request = self.service.files().get_media(fileId=file_id)
-            
-            with open(local_path, 'wb') as f:
-                downloader = MediaIoBaseDownload(f, request)
-                done = False
-                while not done:
-                    _, done = downloader.next_chunk()
-            
-            logger.info(f"Downloaded {remote_name}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to download {remote_name}: {e}")
-            return False
+# Google Drive Configuration
+GOOGLE_DRIVE_ENABLED = False
+gdrive_manager = None
 
-    def file_exists(self, remote_name):
-        """Check if a file exists on Google Drive"""
-        try:
-            query = f"name='{remote_name}' and '{self.folder_id}' in parents and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id, name)").execute()
-            files = results.get('files', [])
-            return len(files) > 0
-        except Exception as e:
-            logger.error(f"Error checking file existence: {e}")
-            return False
-
-# Initialize Google Drive manager
+# Try to import Google Drive dependencies
 try:
-    gdrive_manager = GoogleDriveManager()
-    logger.info("Google Drive integration enabled")
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload
+    
+    class GoogleDriveManager:
+        def __init__(self):
+            try:
+                creds_json = os.environ.get('GOOGLE_DRIVE_CREDENTIALS')
+                if not creds_json:
+                    raise ValueError("GOOGLE_DRIVE_CREDENTIALS not set")
+                
+                self.folder_id = os.environ.get('GOOGLE_DRIVE_FOLDER_ID')
+                if not self.folder_id:
+                    raise ValueError("GOOGLE_DRIVE_FOLDER_ID not set")
+                
+                self.credentials_info = json.loads(creds_json)
+                self.credentials = service_account.Credentials.from_service_account_info(
+                    self.credentials_info,
+                    scopes=['https://www.googleapis.com/auth/drive']
+                )
+                
+                self.service = build('drive', 'v3', credentials=self.credentials)
+                logger.info("Google Drive manager initialized")
+                
+            except Exception as e:
+                logger.error(f"Failed to initialize Google Drive: {e}")
+                raise
+        
+        def download_file(self, remote_name, local_path):
+            """Download a file from Google Drive"""
+            try:
+                query = f"name='{remote_name}' and '{self.folder_id}' in parents and trashed=false"
+                results = self.service.files().list(q=query, fields="files(id, name)").execute()
+                files = results.get('files', [])
+                
+                if not files:
+                    raise FileNotFoundError(f"File {remote_name} not found")
+                
+                file_id = files[0]['id']
+                request = self.service.files().get_media(fileId=file_id)
+                
+                with open(local_path, 'wb') as f:
+                    downloader = MediaIoBaseDownload(f, request)
+                    done = False
+                    while not done:
+                        _, done = downloader.next_chunk()
+                
+                logger.info(f"Downloaded {remote_name}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Failed to download {remote_name}: {e}")
+                return False
+
+    # Initialize Google Drive manager
+    try:
+        gdrive_manager = GoogleDriveManager()
+        GOOGLE_DRIVE_ENABLED = True
+        logger.info("Google Drive integration enabled")
+    except Exception as e:
+        logger.warning(f"Google Drive initialization failed: {e}")
+
+except ImportError:
+    logger.warning("Google Drive dependencies not available")
 except Exception as e:
-    logger.error(f"Google Drive initialization failed: {e}")
-    # Don't exit, we'll handle this gracefully
+    logger.warning(f"Error loading Google Drive: {e}")
 
 class Config:
     """Application configuration"""
@@ -134,7 +135,7 @@ class Config:
 class ModelCache:
     """In-memory cache for loaded models"""
     _cache = {}
-    _lock = threading.Lock()
+    _lock = threading.Lock()  # Fixed: threading is now imported
 
     @classmethod
     def get(cls, client_id):
@@ -160,6 +161,9 @@ class ModelCache:
 
 def download_from_google_drive(client_id):
     """Download model files from Google Drive"""
+    if not GOOGLE_DRIVE_ENABLED:
+        return False
+    
     try:
         prefix = "global" if not client_id else f"client_{client_id}"
         model_files = Config.get_model_files(client_id)
@@ -391,7 +395,9 @@ def health_check():
         gdrive_ok = False
         try:
             if gdrive_manager:
-                gdrive_ok = gdrive_manager.file_exists("global_model.keras")
+                # Try a simple operation to check connectivity
+                gdrive_manager.service.files().list(pageSize=1).execute()
+                gdrive_ok = True
         except:
             pass
         
