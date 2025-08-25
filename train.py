@@ -17,6 +17,7 @@ import logging
 import argparse
 import sys
 import time
+import shutil
 
 # Configure logging more thoroughly
 logging.basicConfig(
@@ -72,6 +73,7 @@ try:
                 # Get folder ID from environment variable
                 self.folder_id = os.environ.get('GOOGLE_DRIVE_FOLDER_ID')
                 logger.info(f"GOOGLE_DRIVE_FOLDER_ID found: {bool(self.folder_id)}")
+                logger.info(f"GOOGLE_DRIVE_FOLDER_ID value: {self.folder_id}")
                 
                 if not self.folder_id:
                     raise ValueError("GOOGLE_DRIVE_FOLDER_ID environment variable not set")
@@ -97,6 +99,12 @@ try:
         def upload_file(self, local_path, remote_name, mime_type='application/octet-stream'):
             """Upload a file to Google Drive"""
             try:
+                logger.info(f"Attempting to upload {local_path} as {remote_name}")
+                
+                if not os.path.exists(local_path):
+                    logger.error(f"Local file not found: {local_path}")
+                    return None
+                
                 file_metadata = {
                     'name': remote_name,
                     'parents': [self.folder_id]
@@ -109,8 +117,9 @@ try:
                     fields='id'
                 ).execute()
                 
-                logger.info(f"Uploaded {remote_name} to Google Drive with ID: {file.get('id')}")
-                return file.get('id')
+                file_id = file.get('id')
+                logger.info(f"Uploaded {remote_name} to Google Drive with ID: {file_id}")
+                return file_id
                 
             except Exception as e:
                 logger.error(f"Failed to upload {remote_name} to Google Drive: {e}")
@@ -283,45 +292,35 @@ def upload_to_google_drive(client_id, model_path, tokenizer_path, labels_path):
         logger.info(f"Starting Google Drive upload for {prefix}")
         
         # Check if files exist locally
-        for path, name in [
-            (model_path, "model"),
-            (tokenizer_path, "tokenizer"), 
-            (labels_path, "labels")
-        ]:
-            if not os.path.exists(path):
-                logger.error(f"Local {name} file not found: {path}")
+        files_to_upload = [
+            (model_path, "model", f"{prefix}_model.keras"),
+            (tokenizer_path, "tokenizer", f"{prefix}_tokenizer.pkl"), 
+            (labels_path, "labels", f"{prefix}_labels.pkl")
+        ]
+        
+        for local_path, file_type, remote_name in files_to_upload:
+            if not os.path.exists(local_path):
+                logger.error(f"Local {file_type} file not found: {local_path}")
                 return False
         
         # Upload files
         upload_results = []
         
-        # Upload model
-        model_remote_name = f"{prefix}_model.keras"
-        model_id = gdrive_manager.upload_file(model_path, model_remote_name)
-        upload_results.append(("model", model_id))
-        
-        # Upload tokenizer
-        tokenizer_remote_name = f"{prefix}_tokenizer.pkl"
-        tokenizer_id = gdrive_manager.upload_file(tokenizer_path, tokenizer_remote_name)
-        upload_results.append(("tokenizer", tokenizer_id))
-        
-        # Upload labels
-        labels_remote_name = f"{prefix}_labels.pkl"
-        labels_id = gdrive_manager.upload_file(labels_path, labels_remote_name)
-        upload_results.append(("labels", labels_id))
+        for local_path, file_type, remote_name in files_to_upload:
+            file_id = gdrive_manager.upload_file(local_path, remote_name)
+            upload_results.append((file_type, file_id))
+            if file_id:
+                logger.info(f"✓ {file_type} uploaded successfully with ID: {file_id}")
+            else:
+                logger.error(f"✗ {file_type} upload failed")
         
         # Check if all uploads were successful
         success = all(result[1] is not None for result in upload_results)
         
         if success:
             logger.info("All model files uploaded to Google Drive successfully")
-            for file_type, file_id in upload_results:
-                logger.info(f"{file_type.capitalize()} uploaded with ID: {file_id}")
         else:
             logger.error("Some files failed to upload to Google Drive")
-            for file_type, file_id in upload_results:
-                status = "✓" if file_id else "✗"
-                logger.info(f"{status} {file_type}: {file_id or 'FAILED'}")
         
         return success
         
@@ -423,14 +422,35 @@ def train_model(client_id=None):
         tokenizer_path = os.path.join(save_dir, "tokenizer.pkl")
         labels_path = os.path.join(save_dir, "labels.pkl")
         
+        # Save model files
         model.save(model_path)
         with open(tokenizer_path, "wb") as f:
             pickle.dump(tokenizer, f)
         with open(labels_path, "wb") as f:
             pickle.dump(label_encoder.classes_, f)
+        
+        # Verify files were saved
+        saved_files = []
+        for path, name in [(model_path, "model"), (tokenizer_path, "tokenizer"), (labels_path, "labels")]:
+            if os.path.exists(path):
+                file_size = os.path.getsize(path)
+                logger.info(f"Saved {name} to {path} ({file_size} bytes)")
+                saved_files.append(True)
+            else:
+                logger.error(f"Failed to save {name} to {path}")
+                saved_files.append(False)
+        
+        if not all(saved_files):
+            logger.error("Failed to save all model files")
+            return False
 
         # Upload to Google Drive
-        upload_to_google_drive(client_id, model_path, tokenizer_path, labels_path)
+        upload_success = upload_to_google_drive(client_id, model_path, tokenizer_path, labels_path)
+        
+        if upload_success:
+            logger.info("Model files successfully uploaded to Google Drive")
+        else:
+            logger.warning("Model files upload to Google Drive failed")
 
         logger.info("Training completed successfully")
         logger.info(f"Vocabulary size: {len(tokenizer.word_index)}")
