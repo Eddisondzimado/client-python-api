@@ -633,6 +633,100 @@ def check_data():
         if conn:
             conn.close()
 
+
+@app.route("/upload-to-gdrive", methods=["POST", "OPTIONS"])
+def upload_to_gdrive():
+    """Manually upload model files to Google Drive"""
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+        
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({
+                "status": "error",
+                "message": "No JSON data received"
+            }), 400
+            
+        client_id = data.get("clientId")
+        
+        if not GOOGLE_DRIVE_ENABLED:
+            return jsonify({
+                "status": "error",
+                "message": "Google Drive integration not enabled"
+            }), 500
+        
+        # Get model files
+        model_files = Config.get_model_files(client_id)
+        
+        # Check if files exist locally
+        missing_files = []
+        for file_type, path in model_files.items():
+            if not os.path.exists(path):
+                missing_files.append(file_type)
+        
+        if missing_files:
+            return jsonify({
+                "status": "error",
+                "message": "Local model files missing",
+                "missing_files": missing_files
+            }), 404
+        
+        # Upload to Google Drive
+        prefix = "global" if not client_id else f"client_{client_id}"
+        
+        upload_results = {}
+        files_to_upload = [
+            ("model", model_files["model"], f"{prefix}_model.keras"),
+            ("tokenizer", model_files["tokenizer"], f"{prefix}_tokenizer.pkl"),
+            ("labels", model_files["labels"], f"{prefix}_labels.pkl")
+        ]
+        
+        for file_type, local_path, remote_name in files_to_upload:
+            try:
+                # Check if file already exists on Google Drive
+                if gdrive_manager.file_exists(remote_name):
+                    upload_results[file_type] = {
+                        "status": "exists",
+                        "message": f"File {remote_name} already exists on Google Drive"
+                    }
+                else:
+                    file_id = gdrive_manager.upload_file(local_path, remote_name)
+                    if file_id:
+                        upload_results[file_type] = {
+                            "status": "success",
+                            "file_id": file_id,
+                            "message": f"Uploaded {remote_name} successfully"
+                        }
+                    else:
+                        upload_results[file_type] = {
+                            "status": "error",
+                            "message": f"Failed to upload {remote_name}"
+                        }
+            except Exception as e:
+                upload_results[file_type] = {
+                    "status": "error",
+                    "message": f"Error uploading {remote_name}: {str(e)}"
+                }
+        
+        # Check if all uploads were successful
+        all_success = all(result["status"] in ["success", "exists"] for result in upload_results.values())
+        
+        return jsonify({
+            "status": "success" if all_success else "partial",
+            "message": "Google Drive upload completed",
+            "results": upload_results,
+            "client_id": client_id
+        })
+        
+    except Exception as e:
+        logger.error(f"Google Drive upload failed: {e}")
+        return jsonify({
+            "status": "error",
+            "message": f"Google Drive upload failed: {str(e)}"
+        }), 500
+
+        
 @app.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint"""
