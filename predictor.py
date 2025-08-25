@@ -11,18 +11,13 @@ import mysql.connector
 import subprocess
 import threading
 import uuid
-from werkzeug.utils import secure_filename
 import logging
 import time
 from datetime import datetime
 import sys
 import functools
 from typing import Dict, Tuple
-import io
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
-from googleapiclient.errors import HttpError
+import gc
 
 # Configure logging
 logging.basicConfig(
@@ -31,15 +26,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configure TensorFlow for optimized performance
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-tf.get_logger().setLevel('ERROR')
-
-# Optimize TensorFlow memory usage
+# Configure TensorFlow for memory optimization
 tf.config.threading.set_inter_op_parallelism_threads(1)
 tf.config.threading.set_intra_op_parallelism_threads(1)
 tf.config.set_soft_device_placement(True)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+tf.get_logger().setLevel('ERROR')
 
 app = Flask(__name__)
 CORS(app)
@@ -48,114 +41,81 @@ CORS(app)
 GOOGLE_DRIVE_ENABLED = False
 gdrive_manager = None
 
-# Google Drive Manager class
-class GoogleDriveManager:
-    def __init__(self):
-        try:
-            logger.info("Initializing Google Drive manager...")
-            
-            # Get credentials from environment variable
-            creds_json = os.environ.get('GOOGLE_DRIVE_CREDENTIALS')
-            logger.info(f"GOOGLE_DRIVE_CREDENTIALS found: {bool(creds_json)}")
-            
-            if not creds_json:
-                raise ValueError("GOOGLE_DRIVE_CREDENTIALS environment variable not set")
-            
-            # Get folder ID from environment variable
-            self.folder_id = os.environ.get('GOOGLE_DRIVE_FOLDER_ID')
-            logger.info(f"GOOGLE_DRIVE_FOLDER_ID found: {bool(self.folder_id)}")
-            
-            if not self.folder_id:
-                raise ValueError("GOOGLE_DRIVE_FOLDER_ID environment variable not set")
-            
-            # Parse the JSON from environment variable
-            self.credentials_info = json.loads(creds_json)
-            
-            # Create credentials
-            self.credentials = service_account.Credentials.from_service_account_info(
-                self.credentials_info,
-                scopes=['https://www.googleapis.com/auth/drive']
-            )
-            
-            # Build the service
-            self.service = build('drive', 'v3', credentials=self.credentials)
-            
-            logger.info("Google Drive manager initialized successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize Google Drive manager: {e}")
-            raise
-    
-    def upload_file(self, local_path, remote_name, mime_type='application/octet-stream'):
-        """Upload a file to Google Drive"""
-        try:
-            file_metadata = {
-                'name': remote_name,
-                'parents': [self.folder_id]
-            }
-            
-            media = MediaFileUpload(local_path, mimetype=mime_type)
-            file = self.service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields='id'
-            ).execute()
-            
-            logger.info(f"Uploaded {remote_name} to Google Drive with ID: {file.get('id')}")
-            return file.get('id')
-            
-        except Exception as e:
-            logger.error(f"Failed to upload {remote_name} to Google Drive: {e}")
-            return None
-
-    def download_file(self, remote_name, local_path):
-        """Download a file from Google Drive"""
-        try:
-            # Search for the file
-            query = f"name='{remote_name}' and '{self.folder_id}' in parents and trashed=false"
-            results = self.service.files().list(q=query, fields="files(id, name)").execute()
-            files = results.get('files', [])
-            
-            if not files:
-                raise FileNotFoundError(f"File {remote_name} not found in Google Drive")
-            
-            file_id = files[0]['id']
-            
-            # Download the file
-            request = self.service.files().get_media(fileId=file_id)
-            fh = io.BytesIO()
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while done is False:
-                status, done = downloader.next_chunk()
-            
-            # Save to local file
-            with open(local_path, 'wb') as f:
-                f.write(fh.getvalue())
-            
-            logger.info(f"Downloaded {remote_name} from Google Drive to {local_path}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to download {remote_name} from Google Drive: {e}")
-            return False
-
-# Initialize Google Drive manager
+# Try to import Google Drive dependencies
 try:
-    gdrive_manager = GoogleDriveManager()
-    GOOGLE_DRIVE_ENABLED = True
-    logger.info("Google Drive integration enabled")
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload
+    
+    class GoogleDriveManager:
+        def __init__(self):
+            try:
+                creds_json = os.environ.get('GOOGLE_DRIVE_CREDENTIALS')
+                if not creds_json:
+                    raise ValueError("GOOGLE_DRIVE_CREDENTIALS not set")
+                
+                self.folder_id = os.environ.get('GOOGLE_DRIVE_FOLDER_ID')
+                if not self.folder_id:
+                    raise ValueError("GOOGLE_DRIVE_FOLDER_ID not set")
+                
+                self.credentials_info = json.loads(creds_json)
+                self.credentials = service_account.Credentials.from_service_account_info(
+                    self.credentials_info,
+                    scopes=['https://www.googleapis.com/auth/drive']
+                )
+                
+                self.service = build('drive', 'v3', credentials=self.credentials)
+                logger.info("Google Drive manager initialized")
+                
+            except Exception as e:
+                logger.error(f"Failed to initialize Google Drive: {e}")
+                raise
+        
+        def download_file(self, remote_name, local_path):
+            """Download a file from Google Drive"""
+            try:
+                query = f"name='{remote_name}' and '{self.folder_id}' in parents and trashed=false"
+                results = self.service.files().list(q=query, fields="files(id, name)").execute()
+                files = results.get('files', [])
+                
+                if not files:
+                    raise FileNotFoundError(f"File {remote_name} not found")
+                
+                file_id = files[0]['id']
+                request = self.service.files().get_media(fileId=file_id)
+                
+                with open(local_path, 'wb') as f:
+                    downloader = MediaIoBaseDownload(f, request)
+                    done = False
+                    while not done:
+                        _, done = downloader.next_chunk()
+                
+                logger.info(f"Downloaded {remote_name}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Failed to download {remote_name}: {e}")
+                return False
+
+    # Initialize Google Drive manager
+    try:
+        gdrive_manager = GoogleDriveManager()
+        GOOGLE_DRIVE_ENABLED = True
+        logger.info("Google Drive integration enabled")
+    except Exception as e:
+        logger.warning(f"Google Drive initialization failed: {e}")
+
+except ImportError:
+    logger.warning("Google Drive dependencies not available")
 except Exception as e:
-    gdrive_manager = None
-    GOOGLE_DRIVE_ENABLED = False
-    logger.warning(f"Google Drive integration disabled: {e}")
+    logger.warning(f"Error loading Google Drive: {e}")
 
 class Config:
     """Application configuration"""
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    MODELS_DIR = os.path.join('data', 'models')  # Changed to relative path
+    MODELS_DIR = os.path.join('data', 'models')
     MIN_CONFIDENCE = 0.05
-    TRAINING_TIMEOUT = 600  # 10 minutes
+    TRAINING_TIMEOUT = 600
 
     # Database configuration
     DB_HOST = os.environ.get('DB_HOST', '104.243.44.92')
@@ -164,16 +124,13 @@ class Config:
     DB_PASS = os.environ.get('DB_PASS', '(ruaN^{r)7I&')
     DB_PORT = int(os.environ.get('DB_PORT', 3306))
     
-
     @classmethod
     def get_model_path(cls, client_id=None):
-        """Returns absolute path to model directory"""
         base_path = os.path.abspath(os.path.join(cls.BASE_DIR, cls.MODELS_DIR))
         return os.path.join(base_path, "global" if not client_id else str(client_id))
     
     @classmethod
     def get_model_files(cls, client_id=None):
-        """Returns dict of expected model file paths"""
         model_dir = cls.get_model_path(client_id)
         return {
             "model": os.path.join(model_dir, "model.keras"),
@@ -181,16 +138,13 @@ class Config:
             "labels": os.path.join(model_dir, "labels.pkl"),
         }
 
-
 # Global training status
 training_in_progress = False
 training_lock = threading.Lock()
 
-
 def get_db_connection():
     """Get database connection with retry logic"""
-    max_retries = 3
-    for attempt in range(max_retries):
+    for attempt in range(3):
         try:
             conn = mysql.connector.connect(
                 host=Config.DB_HOST,
@@ -202,95 +156,76 @@ def get_db_connection():
             )
             return conn
         except Exception as e:
-            logger.error(f"DB connection attempt {attempt + 1} failed: {e}")
-            if attempt == max_retries - 1:
+            if attempt == 2:
                 return None
             time.sleep(1)
 
 class ModelCache:
     """In-memory cache for loaded models"""
-    _instance = None
-    _cache: Dict[Tuple[str, str], Tuple[tf.keras.Model, object, list]] = {}  # (client_id, model_type) -> (model, tokenizer, labels)
+    _cache = {}
     _lock = threading.Lock()
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
     @classmethod
-    def get(cls, client_id: str, model_type: str):
-        """Get cached model"""
+    def get(cls, client_id, model_type):
         key = (client_id or "global", model_type)
         with cls._lock:
             return cls._cache.get(key)
 
     @classmethod
-    def set(cls, client_id: str, model_type: str, model: tf.keras.Model, tokenizer: object, labels: list):
-        """Cache a model"""
+    def set(cls, client_id, model_type, model, tokenizer, labels):
         key = (client_id or "global", model_type)
         with cls._lock:
             cls._cache[key] = (model, tokenizer, labels)
 
     @classmethod
     def clear(cls):
-        """Clear cache"""
         with cls._lock:
             cls._cache.clear()
 
 def download_from_google_drive(client_id):
-    """Download model files from Google Drive if they don't exist locally"""
+    """Download model files from Google Drive"""
     if not GOOGLE_DRIVE_ENABLED:
-        logger.warning("Google Drive not enabled, skipping download")
         return False
     
     try:
         prefix = "global" if not client_id else f"client_{client_id}"
         model_files = Config.get_model_files(client_id)
         
-        # Create directory if it doesn't exist
         os.makedirs(os.path.dirname(model_files["model"]), exist_ok=True)
         
-        # Download files from Google Drive
-        gdrive_manager.download_file(f"{prefix}_model.keras", model_files["model"])
-        gdrive_manager.download_file(f"{prefix}_tokenizer.pkl", model_files["tokenizer"])
-        gdrive_manager.download_file(f"{prefix}_labels.pkl", model_files["labels"])
+        success = True
+        for file_type, remote_name in [
+            ("model", f"{prefix}_model.keras"),
+            ("tokenizer", f"{prefix}_tokenizer.pkl"),
+            ("labels", f"{prefix}_labels.pkl")
+        ]:
+            if not gdrive_manager.download_file(remote_name, model_files[file_type]):
+                success = False
         
-        logger.info(f"Downloaded model files for {prefix} from Google Drive")
-        return True
+        return success
     except Exception as e:
-        logger.error(f"Failed to download from Google Drive: {e}")
+        logger.error(f"Download failed: {e}")
         return False
 
-# Modified predict_intent function with caching
-@functools.lru_cache(maxsize=32)  # Cache recent predictions
+@functools.lru_cache(maxsize=8)  # Reduced cache size
 def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
     """Predict intent from message using cached models"""
     try:
-        # Get from cache or load fresh
         cache_key = client_id or "global"
         cached = ModelCache.get(cache_key, "main")
         
         if not cached:
-            # If not in cache, try to load from disk or Google Drive
             model_files = Config.get_model_files(client_id)
             
-            # Check if we need to download from Google Drive
-            need_download = False
-            for file_type in ["model", "tokenizer", "labels"]:
-                local_path = model_files[file_type]
-                if not os.path.exists(local_path):
-                    need_download = True
-                    break
-            
+            # Check if download needed
+            need_download = any(not os.path.exists(path) for path in model_files.values())
             if need_download:
-                download_success = download_from_google_drive(client_id)
-                if not download_success:
-                    if client_id:  # Fallback to global model
+                if not download_from_google_drive(client_id):
+                    if client_id:
                         return predict_intent(msg)
                     return "fallback", 0.0
             
-            # Now load from local disk
+            # Load from disk
             with tf.device('/cpu:0'):
                 model = tf.keras.models.load_model(model_files["model"], compile=False)
                 with open(model_files["tokenizer"], "rb") as f:
@@ -298,13 +233,12 @@ def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
                 with open(model_files["labels"], "rb") as f:
                     labels = pickle.load(f)
                 
-                # Store in cache for future use
                 ModelCache.set(cache_key, "main", model, tokenizer, labels)
                 cached = (model, tokenizer, labels)
         
         model, tokenizer, labels = cached
         
-        # Process the prediction
+        # Process prediction
         sequence = tokenizer.texts_to_sequences([msg.lower().strip()])
         padded = pad_sequences(sequence, maxlen=model.input_shape[1], padding='post')
         prediction = model.predict(padded, verbose=0)
@@ -316,23 +250,20 @@ def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
     except Exception as e:
         logger.error(f"Prediction error: {e}")
         return "error", 0.0
-    
+
 def _run_training(client_id, training_id):
-    """Enhanced training process with automatic cache loading"""
+    """Training process with memory optimization"""
     global training_in_progress
     
     try:
         model_dir = os.path.join('data', 'models', client_id if client_id else 'global')
         os.makedirs(model_dir, exist_ok=True)
         
-        # Clear any cached models for this client before training
         ModelCache.clear()
         
         cmd = [sys.executable, "train.py"]
         if client_id:
             cmd.extend(["--client-id", client_id])
-            
-        logger.info(f"Starting training in {model_dir}")
         
         process = subprocess.Popen(
             cmd,
@@ -355,13 +286,12 @@ def _run_training(client_id, training_id):
                 os.path.join(model_dir, "labels.pkl")
             ]
             
-            missing = [f for f in required_files if not os.path.exists(f)]
-            if missing:
-                raise Exception(f"Missing output files: {missing}")
+            if any(not os.path.exists(f) for f in required_files):
+                raise Exception("Missing output files")
                 
             logger.info("Training completed successfully")
             
-            # NEW: Load the trained models into cache immediately
+            # Load into cache
             try:
                 with tf.device('/cpu:0'):
                     model = tf.keras.models.load_model(required_files[0], compile=False)
@@ -371,18 +301,16 @@ def _run_training(client_id, training_id):
                         labels = pickle.load(f)
                     
                     ModelCache.set(client_id or "global", "main", model, tokenizer, labels)
-                    logger.info(f"Successfully cached model for client: {client_id or 'global'}")
                     
-            except Exception as cache_error:
-                logger.error(f"Failed to cache model: {str(cache_error)}")
-                # This isn't fatal - the system will load from disk later
+            except Exception as e:
+                logger.error(f"Failed to cache model: {e}")
                 
         except subprocess.TimeoutExpired:
             process.kill()
             raise Exception("Training timed out")
             
     except Exception as e:
-        logger.error(f"Training failed: {str(e)}")
+        logger.error(f"Training failed: {e}")
         # Clean up partial files
         for f in required_files:
             if os.path.exists(f):
@@ -390,43 +318,26 @@ def _run_training(client_id, training_id):
         raise
     finally:
         training_in_progress = False
-
-
+        gc.collect()
 
 def get_response(intent, client_id=None):
-    """Get response for intent with improved error handling"""
+    """Get response for intent"""
     conn = None
     try:
         conn = get_db_connection()
         if not conn:
-            logger.error("Failed to establish database connection")
             return {
                 "response": "I'm having connection issues. Please try again later.",
-                "status": "db_error",
-                "error": "Database connection failed"
+                "status": "db_error"
             }
 
-        # Build queries with proper parameterization
-        queries = []
-        params = []
+        queries, params = [], []
         
-        # 1. First try client-specific response if client_id provided
         if client_id:
-            queries.append("""
-                SELECT responses FROM chatbot_intents 
-                WHERE tag = %s AND user_token = %s
-                ORDER BY created_at DESC
-                LIMIT 1
-            """)
+            queries.append("SELECT responses FROM chatbot_intents WHERE tag = %s AND user_token = %s ORDER BY created_at DESC LIMIT 1")
             params.append((intent, client_id))
         
-        # 2. Always include global responses as fallback
-        queries.append("""
-            SELECT responses FROM chatbot_intents 
-            WHERE tag = %s AND user_token IS NULL
-            ORDER BY created_at DESC
-            LIMIT 1
-        """)
+        queries.append("SELECT responses FROM chatbot_intents WHERE tag = %s AND user_token IS NULL ORDER BY created_at DESC LIMIT 1")
         params.append((intent,))
 
         response = None
@@ -437,10 +348,8 @@ def get_response(intent, client_id=None):
                     if result := cursor.fetchone():
                         responses = json.loads(result["responses"])
                         response = random.choice(responses)
-                        logger.info(f"Found response for intent '{intent}'")
                         break
-                except Exception as e:
-                    logger.warning(f"Query failed: {query} with params {param}. Error: {str(e)}")
+                except Exception:
                     continue
 
         if response:
@@ -450,33 +359,21 @@ def get_response(intent, client_id=None):
                 "source": "client" if client_id and query == queries[0] else "global"
             }
         
-        logger.warning(f"No response found for intent: {intent}")
         return {
             "response": "I'm not sure how to respond to that. Could you rephrase?",
             "status": "no_response",
             "intent": intent
         }
 
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error in responses: {str(e)}")
-        return {
-            "response": "There seems to be a problem with my response data.",
-            "status": "data_error",
-            "error": "Invalid response format"
-        }
     except Exception as e:
-        logger.error(f"Unexpected error in get_response: {str(e)}", exc_info=True)
+        logger.error(f"Response error: {e}")
         return {
             "response": "Sorry, I encountered an error processing your request.",
-            "status": "error",
-            "error": str(e)
+            "status": "error"
         }
     finally:
-        if conn and conn.is_connected():
-            try:
-                conn.close()
-            except Exception as e:
-                logger.warning(f"Error closing connection: {str(e)}")
+        if conn:
+            conn.close()
 
 @app.route("/predict", methods=["POST", "OPTIONS"])
 def predict():
@@ -484,7 +381,6 @@ def predict():
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
     
-    # Check Content-Type header
     if request.content_type != 'application/json':
         return jsonify({
             "error": "Unsupported Media Type",
@@ -520,24 +416,23 @@ def predict():
 
         response = get_response(intent, client_id)
         return jsonify({
-            "response": response,
+            "response": response["response"],
             "intent": intent,
             "confidence": round(confidence, 2),
-            "status": "success"
+            "status": response["status"]
         })
 
     except Exception as e:
-        logger.error(f"Prediction error: {str(e)}")
+        logger.error(f"Prediction error: {e}")
         return jsonify({
             "error": "Internal Server Error",
             "message": "Failed to process request"
         }), 500
-    
 
 @app.route("/train", methods=["POST", "OPTIONS"])
 def start_training():
-    """Initiate training process with detailed responses"""
-    global training_in_progress  # Add this line
+    """Initiate training process"""
+    global training_in_progress
     
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
@@ -547,8 +442,7 @@ def start_training():
         if not data or not isinstance(data, dict):
             return jsonify({
                 "status": "error",
-                "message": "Invalid request data",
-                "details": "Expected JSON payload"
+                "message": "Invalid request data"
             }), 400
             
         client_id = data.get("clientId")
@@ -557,14 +451,12 @@ def start_training():
             if training_in_progress:
                 return jsonify({
                     "status": "error",
-                    "message": "Training already in progress",
-                    "details": "Only one training session can run at a time"
+                    "message": "Training already in progress"
                 }), 429
 
             training_id = str(uuid.uuid4())
             training_in_progress = True
             
-            # Start training in background thread
             threading.Thread(
                 target=_run_training,
                 args=(client_id, training_id),
@@ -577,18 +469,16 @@ def start_training():
                 "training_id": training_id,
                 "details": {
                     "client_id": client_id,
-                    "start_time": datetime.now().isoformat(),
-                    "estimated_time": "Typically takes 3-5 minutes"
+                    "start_time": datetime.now().isoformat()
                 }
             })
 
     except Exception as e:
-        logger.error(f"Training initialization failed: {str(e)}", exc_info=True)
-        training_in_progress = False  # Ensure we reset on error
+        logger.error(f"Training initialization failed: {e}")
+        training_in_progress = False
         return jsonify({
             "status": "error",
-            "message": "Failed to start training",
-            "details": str(e)
+            "message": "Failed to start training"
         }), 500
 
 @app.route("/training-complete", methods=["GET"])
@@ -597,54 +487,31 @@ def check_training_complete():
     with training_lock:
         return jsonify({
             "status": "success" if not training_in_progress else "running",
-            "message": "Training completed successfully" if not training_in_progress else "Training in progress",
-            "details": {
-                "last_training_time": datetime.now().isoformat() if not training_in_progress else None
-            }
+            "message": "Training completed successfully" if not training_in_progress else "Training in progress"
         })
 
 @app.route("/check-models", methods=["GET"])
 def check_models():
-    """Enhanced model verification endpoint"""
+    """Model verification endpoint"""
     try:
         client_id = request.args.get("clientId")
         model_dir = os.path.join('data', 'models', client_id if client_id else 'global')
-        abs_path = os.path.abspath(model_dir)
-        
-        logger.info(f"Checking model path: {abs_path}")
-
-        # Create directory if it doesn't exist
         os.makedirs(model_dir, exist_ok=True)
 
-        required_files = {
-            "model": os.path.join(model_dir, "model.keras"),
-            "tokenizer": os.path.join(model_dir, "tokenizer.pkl"), 
-            "labels": os.path.join(model_dir, "labels.pkl")
-        }
-
-        # Check for files
-        existing = {}
-        missing = []
+        required_files = Config.get_model_files(client_id)
+        existing, missing = {}, []
+        
         for name, path in required_files.items():
             if os.path.exists(path):
-                existing[name] = {
-                    "size": os.path.getsize(path),
-                    "modified": os.path.getmtime(path)
-                }
+                existing[name] = {"size": os.path.getsize(path)}
             else:
                 missing.append(name)
 
         if missing:
-            logger.warning(f"Missing model files: {missing}")
-            # Check if this is first-time training
-            is_first_time = not any(existing.values())
             return jsonify({
                 "status": "error",
-                "message": "First-time training required" if is_first_time else "Model files incomplete",
-                "model_status": "first_time" if is_first_time else "incomplete",
-                "missing_files": missing,
-                "directory_contents": os.listdir(model_dir),
-                "suggested_action": "Run training" if is_first_time else "Retrain or check model files"
+                "message": "Model files incomplete",
+                "missing_files": missing
             }), 404
 
         # Verify file integrity
@@ -662,20 +529,16 @@ def check_models():
             })
             
         except Exception as e:
-            logger.error(f"Model verification failed: {str(e)}")
             return jsonify({
                 "status": "error",
                 "model_status": "corrupted",
-                "error": str(e),
-                "suggested_action": "Retrain model"
+                "error": str(e)
             }), 500
 
     except Exception as e:
-        logger.error(f"Model check failed: {str(e)}")
         return jsonify({
             "status": "error",
-            "error": str(e),
-            "suggested_action": "Check server logs"
+            "error": str(e)
         }), 500
 
 @app.route("/check-data", methods=["GET"])
@@ -688,8 +551,7 @@ def check_data():
         if not conn:
             return jsonify({
                 "status": "error",
-                "message": "Database connection failed",
-                "data_status": "unavailable"
+                "message": "Database connection failed"
             }), 500
             
         query = "SELECT COUNT(*) as count FROM chatbot_intents WHERE user_token = %s OR user_token IS NULL"
@@ -701,31 +563,27 @@ def check_data():
             return jsonify({
                 "status": "success",
                 "message": "Data available",
-                "data_status": "available",
                 "count": result["count"]
             })
         else:
             return jsonify({
                 "status": "error",
-                "message": "No training data found",
-                "data_status": "unavailable"
+                "message": "No training data found"
             }), 404
             
     except Exception as e:
         return jsonify({
             "status": "error",
-            "message": str(e),
-            "data_status": "error"
+            "message": str(e)
         }), 500
     finally:
-        if conn and conn.is_connected():
+        if conn:
             conn.close()
 
 @app.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint"""
     try:
-        # Basic health check - try database connection
         conn = get_db_connection()
         if not conn:
             raise Exception("Database connection failed")
@@ -744,41 +602,6 @@ def health_check():
         return jsonify({
             "status": "error",
             "error": str(e)
-        }), 500
-
-@app.route("/debug/google-drive", methods=["GET"])
-def debug_google_drive():
-    """Debug endpoint to check Google Drive status"""
-    try:
-        # Check if environment variables are set
-        creds_set = bool(os.environ.get('GOOGLE_DRIVE_CREDENTIALS'))
-        folder_id_set = bool(os.environ.get('GOOGLE_DRIVE_FOLDER_ID'))
-        
-        # Try to initialize Google Drive manager to get detailed error
-        try:
-            test_manager = GoogleDriveManager()
-            drive_status = "initialized_successfully"
-            folder_id = test_manager.folder_id
-        except Exception as e:
-            drive_status = f"initialization_failed: {str(e)}"
-            folder_id = None
-        
-        return jsonify({
-            "status": "success",
-            "environment_variables": {
-                "GOOGLE_DRIVE_CREDENTIALS_set": creds_set,
-                "GOOGLE_DRIVE_FOLDER_ID_set": folder_id_set,
-                "GOOGLE_DRIVE_FOLDER_ID_value": os.environ.get('GOOGLE_DRIVE_FOLDER_ID')
-            },
-            "google_drive_status": drive_status,
-            "folder_id": folder_id,
-            "gdrive_manager_global": "initialized" if gdrive_manager is not None else "failed"
-        })
-        
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
         }), 500
 
 if __name__ == "__main__":

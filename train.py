@@ -17,16 +17,12 @@ import logging
 import argparse
 import sys
 import time
-import shutil
+import gc
 
-# Configure logging more thoroughly
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('training.log')
-    ]
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -35,6 +31,13 @@ SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
+
+# Configure TensorFlow for memory optimization
+tf.config.threading.set_inter_op_parallelism_threads(1)
+tf.config.threading.set_intra_op_parallelism_threads(1)
+tf.config.set_soft_device_placement(True)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 # Database Configuration
 DB_CONFIG = {
@@ -45,62 +48,45 @@ DB_CONFIG = {
     'port': int(os.getenv('DB_PORT', 3306))
 }
 
-# Google Drive Configuration - Initialize as disabled first
+# Google Drive Configuration
 GOOGLE_DRIVE_ENABLED = False
 gdrive_manager = None
 
-# Try to import Google Drive dependencies with proper error handling
+# Try to import Google Drive dependencies
 try:
-    import io
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
-    from googleapiclient.errors import HttpError
+    from googleapiclient.http import MediaFileUpload
     
-    # Google Drive Manager class
     class GoogleDriveManager:
         def __init__(self):
             try:
                 logger.info("Initializing Google Drive manager...")
                 
-                # Get credentials from environment variable
                 creds_json = os.environ.get('GOOGLE_DRIVE_CREDENTIALS')
-                logger.info(f"GOOGLE_DRIVE_CREDENTIALS found: {bool(creds_json)}")
-                
                 if not creds_json:
-                    raise ValueError("GOOGLE_DRIVE_CREDENTIALS environment variable not set")
+                    raise ValueError("GOOGLE_DRIVE_CREDENTIALS not set")
                 
-                # Get folder ID from environment variable
                 self.folder_id = os.environ.get('GOOGLE_DRIVE_FOLDER_ID')
-                logger.info(f"GOOGLE_DRIVE_FOLDER_ID found: {bool(self.folder_id)}")
-                logger.info(f"GOOGLE_DRIVE_FOLDER_ID value: {self.folder_id}")
-                
                 if not self.folder_id:
-                    raise ValueError("GOOGLE_DRIVE_FOLDER_ID environment variable not set")
+                    raise ValueError("GOOGLE_DRIVE_FOLDER_ID not set")
                 
-                # Parse the JSON from environment variable
                 self.credentials_info = json.loads(creds_json)
-                
-                # Create credentials
                 self.credentials = service_account.Credentials.from_service_account_info(
                     self.credentials_info,
                     scopes=['https://www.googleapis.com/auth/drive']
                 )
                 
-                # Build the service
                 self.service = build('drive', 'v3', credentials=self.credentials)
-                
                 logger.info("Google Drive manager initialized successfully")
                 
             except Exception as e:
-                logger.error(f"Failed to initialize Google Drive manager: {e}")
+                logger.error(f"Failed to initialize Google Drive: {e}")
                 raise
         
-        def upload_file(self, local_path, remote_name, mime_type='application/octet-stream'):
+        def upload_file(self, local_path, remote_name):
             """Upload a file to Google Drive"""
             try:
-                logger.info(f"Attempting to upload {local_path} as {remote_name}")
-                
                 if not os.path.exists(local_path):
                     logger.error(f"Local file not found: {local_path}")
                     return None
@@ -110,7 +96,7 @@ try:
                     'parents': [self.folder_id]
                 }
                 
-                media = MediaFileUpload(local_path, mimetype=mime_type)
+                media = MediaFileUpload(local_path)
                 file = self.service.files().create(
                     body=file_metadata,
                     media_body=media,
@@ -118,31 +104,25 @@ try:
                 ).execute()
                 
                 file_id = file.get('id')
-                logger.info(f"Uploaded {remote_name} to Google Drive with ID: {file_id}")
+                logger.info(f"Uploaded {remote_name} to Google Drive")
                 return file_id
                 
             except Exception as e:
-                logger.error(f"Failed to upload {remote_name} to Google Drive: {e}")
+                logger.error(f"Failed to upload {remote_name}: {e}")
                 return None
 
-    # Try to initialize Google Drive manager
+    # Initialize Google Drive manager
     try:
         gdrive_manager = GoogleDriveManager()
         GOOGLE_DRIVE_ENABLED = True
         logger.info("Google Drive integration enabled")
     except Exception as e:
         logger.warning(f"Google Drive initialization failed: {e}")
-        GOOGLE_DRIVE_ENABLED = False
-        gdrive_manager = None
 
-except ImportError as e:
-    logger.warning(f"Google Drive dependencies not available: {e}")
-    GOOGLE_DRIVE_ENABLED = False
-    gdrive_manager = None
+except ImportError:
+    logger.warning("Google Drive dependencies not available")
 except Exception as e:
-    logger.warning(f"Unexpected error loading Google Drive: {e}")
-    GOOGLE_DRIVE_ENABLED = False
-    gdrive_manager = None
+    logger.warning(f"Error loading Google Drive: {e}")
 
 def clean_text(text):
     """Basic text cleaning"""
@@ -153,35 +133,31 @@ def get_db_connection():
     for attempt in range(3):
         try:
             conn = mysql.connector.connect(**DB_CONFIG)
-            logger.info("Database connection established")
             return conn
         except Exception as e:
-            logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
+            logger.warning(f"DB connection attempt {attempt + 1} failed: {e}")
             if attempt == 2:
                 return None
             time.sleep(2)
 
 def augment_patterns(patterns):
     """Generate variations of patterns for data augmentation"""
-    augmented = patterns.copy()
+    augmented = set(patterns)
     for pattern in patterns:
-        # Add variations for questions
         if '?' in pattern:
-            augmented.append(pattern.replace('?', ''))
-            augmented.append(pattern + ' please')
-            augmented.append('can you ' + pattern)
-        # Add variations for greetings
+            augmented.add(pattern.replace('?', ''))
+            augmented.add(pattern + ' please')
+            augmented.add('can you ' + pattern)
         if any(word in pattern for word in ['hello', 'hi', 'hey']):
-            augmented.append(pattern + ' there')
-            augmented.append('hey ' + pattern)
-        # Add variations for commands
+            augmented.add(pattern + ' there')
+            augmented.add('hey ' + pattern)
         if any(word in pattern for word in ['show', 'tell', 'give']):
-            augmented.append('please ' + pattern)
-            augmented.append('could you ' + pattern)
-    return list(set(augmented))  # Remove duplicates
+            augmented.add('please ' + pattern)
+            augmented.add('could you ' + pattern)
+    return list(augmented)
 
 def load_training_data(client_id=None):
-    """Load and validate training data with class balancing"""
+    """Load and validate training data"""
     conn = get_db_connection()
     if not conn:
         logger.error("Failed to connect to database")
@@ -212,10 +188,8 @@ def load_training_data(client_id=None):
                     patterns = [clean_text(p) for p in json.loads(row["patterns"]) if p.strip()]
                     responses = json.loads(row["responses"])
                     
-                    if len(patterns) >= 1:  # Minimum patterns per intent
-                        # Augment patterns to balance classes
+                    if len(patterns) >= 1:
                         augmented_patterns = augment_patterns(patterns)
-                        
                         intents.append({
                             "tag": row["tag"],
                             "patterns": augmented_patterns,
@@ -223,128 +197,112 @@ def load_training_data(client_id=None):
                         })
                 except json.JSONDecodeError as e:
                     logger.error(f"JSON decode error for intent {row['tag']}: {e}")
-                except Exception as e:
-                    logger.error(f"Error processing intent {row['tag']}: {e}")
             
-            logger.info(f"Loaded {len(intents)} intents after augmentation")
+            logger.info(f"Loaded {len(intents)} intents")
             return {"intents": intents} if intents else None
             
     except Exception as e:
         logger.error(f"Error loading training data: {e}")
         return None
     finally:
-        if conn and conn.is_connected():
+        if conn:
             conn.close()
 
-def build_model(vocab_size, num_classes, max_sequence_length):
-    """Create optimized LSTM model for imbalanced data"""
+def build_optimized_model(vocab_size, num_classes, max_sequence_length):
+    """Create memory-optimized LSTM model"""
     model = Sequential([
-        Embedding(vocab_size + 1, 128, input_length=max_sequence_length, mask_zero=True),
-        Bidirectional(LSTM(64, return_sequences=True)),
-        Dropout(0.5),
-        Bidirectional(LSTM(32)),
-        Dropout(0.4),  # Increased dropout for regularization
-        Dense(64, activation='relu'),
+        Embedding(vocab_size + 1, 64, input_length=max_sequence_length, mask_zero=True),
+        Bidirectional(LSTM(32, return_sequences=True)),
+        Dropout(0.4),
+        Bidirectional(LSTM(16)),
         Dropout(0.3),
+        Dense(32, activation='relu'),
+        Dropout(0.2),
         Dense(num_classes, activation='softmax')
     ])
     
     model.compile(
         loss='sparse_categorical_crossentropy',
-        optimizer=tf.keras.optimizers.Adam(0.0005),  # Lower learning rate
+        optimizer=tf.keras.optimizers.Adam(0.001),
         metrics=['accuracy']
     )
     return model
 
 def balanced_train_test_split(X, y, test_size=0.2, min_samples=2):
-    """Custom train-test split that handles imbalanced classes"""
+    """Custom train-test split for imbalanced classes"""
     from collections import defaultdict
     
-    # Group indices by class
     class_indices = defaultdict(list)
     for i, label in enumerate(y):
         class_indices[label].append(i)
     
-    train_indices = []
-    val_indices = []
+    train_indices, val_indices = [], []
     
     for label, indices in class_indices.items():
         if len(indices) >= min_samples:
-            # For classes with enough samples, do stratified split
             split_idx = max(1, int(len(indices) * (1 - test_size)))
             train_indices.extend(indices[:split_idx])
             val_indices.extend(indices[split_idx:])
         else:
-            # For small classes, put all in training
             train_indices.extend(indices)
-            logger.warning(f"Class {label} has only {len(indices)} samples - using all for training")
+            logger.warning(f"Class {label} has only {len(indices)} samples")
     
     return X[train_indices], X[val_indices], y[train_indices], y[val_indices]
 
 def upload_to_google_drive(client_id, model_path, tokenizer_path, labels_path):
-    """Upload model files to Google Drive with detailed logging"""
+    """Upload model files to Google Drive"""
     if not GOOGLE_DRIVE_ENABLED:
-        logger.warning("Google Drive not enabled, skipping upload")
+        logger.warning("Google Drive not enabled")
         return False
     
     try:
         prefix = "global" if not client_id else f"client_{client_id}"
-        logger.info(f"Starting Google Drive upload for {prefix}")
         
-        # Check if files exist locally
-        files_to_upload = [
-            (model_path, "model", f"{prefix}_model.keras"),
-            (tokenizer_path, "tokenizer", f"{prefix}_tokenizer.pkl"), 
-            (labels_path, "labels", f"{prefix}_labels.pkl")
-        ]
-        
-        for local_path, file_type, remote_name in files_to_upload:
-            if not os.path.exists(local_path):
-                logger.error(f"Local {file_type} file not found: {local_path}")
+        # Check files exist
+        for path in [model_path, tokenizer_path, labels_path]:
+            if not os.path.exists(path):
+                logger.error(f"File not found: {path}")
                 return False
         
         # Upload files
         upload_results = []
+        files_to_upload = [
+            (model_path, f"{prefix}_model.keras"),
+            (tokenizer_path, f"{prefix}_tokenizer.pkl"),
+            (labels_path, f"{prefix}_labels.pkl")
+        ]
         
-        for local_path, file_type, remote_name in files_to_upload:
+        for local_path, remote_name in files_to_upload:
             file_id = gdrive_manager.upload_file(local_path, remote_name)
-            upload_results.append((file_type, file_id))
-            if file_id:
-                logger.info(f"✓ {file_type} uploaded successfully with ID: {file_id}")
-            else:
-                logger.error(f"✗ {file_type} upload failed")
+            upload_results.append(file_id is not None)
         
-        # Check if all uploads were successful
-        success = all(result[1] is not None for result in upload_results)
-        
+        success = all(upload_results)
         if success:
-            logger.info("All model files uploaded to Google Drive successfully")
+            logger.info("All files uploaded to Google Drive")
         else:
-            logger.error("Some files failed to upload to Google Drive")
+            logger.error("Some files failed to upload")
         
         return success
         
     except Exception as e:
-        logger.error(f"Failed to upload to Google Drive: {e}", exc_info=True)
+        logger.error(f"Upload failed: {e}")
         return False
 
 def train_model(client_id=None):
-    """Main training function with class balancing"""
+    """Main training function with memory optimization"""
     try:
-        # Load and prepare data
+        # Load data
         data = load_training_data(client_id)
         if not data:
-            logger.error("No valid training data available")
             return False
 
         # Prepare text data
-        texts = []
-        labels = []
+        texts, labels = [], []
         for intent in data["intents"]:
             texts.extend(intent["patterns"])
             labels.extend([intent["tag"]] * len(intent["patterns"]))
 
-        logger.info(f"Total training samples: {len(texts)}")
+        logger.info(f"Training samples: {len(texts)}")
         
         # Tokenize text
         tokenizer = Tokenizer(oov_token="<OOV>")
@@ -357,64 +315,36 @@ def train_model(client_id=None):
         label_encoder = LabelEncoder()
         y = label_encoder.fit_transform(labels)
         
-        # Check class distribution
-        class_counts = Counter(y)
-        logger.info(f"Class distribution: {dict(class_counts)}")
-        logger.info(f"Classes: {label_encoder.classes_}")
+        # Split data
+        X_train, X_val, y_train, y_val = balanced_train_test_split(padded, y)
         
-        # Use balanced train-test split
-        X_train, X_val, y_train, y_val = balanced_train_test_split(
-            padded, y, test_size=0.2, min_samples=2
-        )
-        
-        logger.info(f"Training samples: {len(X_train)}, Validation samples: {len(X_val)}")
-        
-        # Compute class weights for imbalanced data
+        # Compute class weights
         try:
-            class_weights = compute_class_weight(
-                'balanced', 
-                classes=np.unique(y_train), 
-                y=y_train
-            )
+            class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
             class_weight_dict = dict(enumerate(class_weights))
-            logger.info(f"Class weights: {class_weight_dict}")
-        except ValueError as e:
-            logger.warning(f"Could not compute class weights: {e}")
+        except ValueError:
             class_weight_dict = None
 
         # Build and train model
-        model = build_model(
-            len(tokenizer.word_index),
-            len(label_encoder.classes_),
-            max_len
-        )
+        model = build_optimized_model(len(tokenizer.word_index), len(label_encoder.classes_), max_len)
 
-        # Adjust batch size based on dataset size
-        batch_size = min(32, max(8, len(X_train) // 10))
+        # Adjust batch size for memory optimization
+        batch_size = min(16, max(4, len(X_train) // 20))
         
         model.fit(
             X_train, y_train,
             validation_data=(X_val, y_val) if len(X_val) > 0 else None,
-            epochs=100,
+            epochs=50,  # Reduced epochs
             batch_size=batch_size,
             class_weight=class_weight_dict,
             callbacks=[
-                tf.keras.callbacks.EarlyStopping(
-                    patience=10, 
-                    restore_best_weights=True,
-                    monitor='val_loss' if len(X_val) > 0 else 'loss'
-                ),
-                tf.keras.callbacks.ReduceLROnPlateau(
-                    factor=0.2, 
-                    patience=5, 
-                    min_lr=1e-5,
-                    monitor='val_loss' if len(X_val) > 0 else 'loss'
-                )
+                tf.keras.callbacks.EarlyStopping(patience=8, restore_best_weights=True),
+                tf.keras.callbacks.ReduceLROnPlateau(factor=0.2, patience=4)
             ],
-            verbose=2
+            verbose=1  # Reduced verbosity
         )
 
-        # Save model locally
+        # Save model
         save_dir = os.path.join("data/models", "global" if not client_id else str(client_id))
         os.makedirs(save_dir, exist_ok=True)
         
@@ -422,44 +352,25 @@ def train_model(client_id=None):
         tokenizer_path = os.path.join(save_dir, "tokenizer.pkl")
         labels_path = os.path.join(save_dir, "labels.pkl")
         
-        # Save model files
-        model.save(model_path)
+        # Save files
+        model.save(model_path, save_format='tf')
         with open(tokenizer_path, "wb") as f:
-            pickle.dump(tokenizer, f)
+            pickle.dump(tokenizer, f, protocol=4)  # Protocol 4 for compatibility
         with open(labels_path, "wb") as f:
-            pickle.dump(label_encoder.classes_, f)
-        
-        # Verify files were saved
-        saved_files = []
-        for path, name in [(model_path, "model"), (tokenizer_path, "tokenizer"), (labels_path, "labels")]:
-            if os.path.exists(path):
-                file_size = os.path.getsize(path)
-                logger.info(f"Saved {name} to {path} ({file_size} bytes)")
-                saved_files.append(True)
-            else:
-                logger.error(f"Failed to save {name} to {path}")
-                saved_files.append(False)
-        
-        if not all(saved_files):
-            logger.error("Failed to save all model files")
-            return False
+            pickle.dump(label_encoder.classes_, f, protocol=4)
 
         # Upload to Google Drive
-        upload_success = upload_to_google_drive(client_id, model_path, tokenizer_path, labels_path)
-        
-        if upload_success:
-            logger.info("Model files successfully uploaded to Google Drive")
-        else:
-            logger.warning("Model files upload to Google Drive failed")
+        upload_to_google_drive(client_id, model_path, tokenizer_path, labels_path)
+
+        # Clean up memory
+        del model, tokenizer, label_encoder, X_train, X_val, y_train, y_val
+        gc.collect()
 
         logger.info("Training completed successfully")
-        logger.info(f"Vocabulary size: {len(tokenizer.word_index)}")
-        logger.info(f"Number of classes: {len(label_encoder.classes_)}")
-        
         return True
 
     except Exception as e:
-        logger.error(f"Training failed: {e}", exc_info=True)
+        logger.error(f"Training failed: {e}")
         return False
 
 if __name__ == "__main__":
