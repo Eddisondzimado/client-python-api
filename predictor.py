@@ -308,10 +308,10 @@ def get_response(intent, client_id=None):
         queries, params = [], []
         
         if client_id:
-            queries.append("SELECT responses FROM chatbot_intents WHERE tag = %s AND user_token = %s ORDER BY created_at DESC LIMIT 1")
+            queries.append("SELECT responses FROM chatbot_intents WHERE tag = %s AND user_token = %s ORDER BY created_at DESC LIMit 1")
             params.append((intent, client_id))
         
-        queries.append("SELECT responses FROM chatbot_intents WHERE tag = %s AND user_token IS NULL ORDER BY created_at DESC LIMIT 1")
+        queries.append("SELECT responses FROM chatbot_intents WHERE tag = %s AND user_token IS NULL ORDER BY created_at DESC LIMit 1")
         params.append((intent,))
 
         response = None
@@ -389,7 +389,7 @@ def _run_training(client_id, training_id):
                 
             logger.info("Training completed successfully")
             
-            # Load into cache
+            # Load into cache - FIXED: Only pass 4 arguments
             try:
                 with tf.device('/cpu:0'):
                     model = tf.keras.models.load_model(required_files[0], compile=False)
@@ -398,7 +398,8 @@ def _run_training(client_id, training_id):
                     with open(required_files[2], "rb") as f:
                         labels = pickle.load(f)
                     
-                    ModelCache.set(client_id or "global", "main", model, tokenizer, labels)
+                    # FIXED: Only pass 4 arguments to set()
+                    ModelCache.set(client_id, model, tokenizer, labels)
                     
             except Exception as e:
                 logger.error(f"Failed to cache model: {e}")
@@ -543,6 +544,7 @@ def check_training_complete():
             "message": "Training completed successfully" if not training_in_progress else "Training in progress",
             "training_in_progress": training_in_progress
         })
+
 @app.route("/check-models", methods=["GET"])
 def check_models():
     """Model verification endpoint"""
@@ -633,6 +635,60 @@ def check_data():
         if conn:
             conn.close()
 
+@app.route("/gdrive-status", methods=["GET"])
+def check_gdrive_status():
+    """Check Google Drive connection status"""
+    try:
+        client_id = request.args.get("clientId")
+        prefix = "global" if not client_id else f"client_{client_id}"
+        
+        if not GOOGLE_DRIVE_ENABLED:
+            return jsonify({
+                "status": "error",
+                "message": "Google Drive integration not enabled. Please check environment variables.",
+                "google_drive_connected": False,
+                "files_on_gdrive": {},
+                "configured": False
+            }), 500
+        
+        # Check connection by listing files
+        try:
+            gdrive_manager.service.files().list(pageSize=1).execute()
+            connection_ok = True
+        except Exception as e:
+            connection_ok = False
+            logger.error(f"Google Drive connection test failed: {e}")
+        
+        # Check if model files exist on Google Drive
+        files_exist = {}
+        for file_type, remote_name in [
+            ("model", f"{prefix}_model.keras"),
+            ("tokenizer", f"{prefix}_tokenizer.pkl"),
+            ("labels", f"{prefix}_labels.pkl")
+        ]:
+            try:
+                files_exist[file_type] = gdrive_manager.file_exists(remote_name)
+            except Exception as e:
+                files_exist[file_type] = False
+                logger.error(f"Error checking {remote_name}: {e}")
+        
+        return jsonify({
+            "status": "success",
+            "google_drive_connected": connection_ok,
+            "files_on_gdrive": files_exist,
+            "client_id": client_id,
+            "configured": True
+        })
+        
+    except Exception as e:
+        logger.error(f"Google Drive status check failed: {e}")
+        return jsonify({
+            "status": "error",
+            "message": f"Google Drive status check failed: {str(e)}",
+            "google_drive_connected": False,
+            "files_on_gdrive": {},
+            "configured": False
+        }), 500
 
 @app.route("/upload-to-gdrive", methods=["POST", "OPTIONS"])
 def upload_to_gdrive():
@@ -726,7 +782,6 @@ def upload_to_gdrive():
             "message": f"Google Drive upload failed: {str(e)}"
         }), 500
 
-        
 @app.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint"""
@@ -736,22 +791,29 @@ def health_check():
             raise Exception("Database connection failed")
         conn.close()
         
-        # Check if we can access Google Drive
-        gdrive_ok = False
-        try:
-            if gdrive_manager:
-                # Try a simple operation to check connectivity
+        # Check Google Drive status with better error handling
+        gdrive_status = {
+            "enabled": GOOGLE_DRIVE_ENABLED,
+            "connected": False,
+            "error": None
+        }
+        
+        if GOOGLE_DRIVE_ENABLED:
+            try:
                 gdrive_manager.service.files().list(pageSize=1).execute()
-                gdrive_ok = True
-        except:
-            pass
+                gdrive_status["connected"] = True
+            except Exception as e:
+                gdrive_status["connected"] = False
+                gdrive_status["error"] = str(e)
+        else:
+            gdrive_status["error"] = "Google Drive not configured. Check GOOGLE_DRIVE_CREDENTIALS and GOOGLE_DRIVE_FOLDER_ID environment variables."
         
         return jsonify({
             "status": "ok",
             "timestamp": datetime.now().isoformat(),
             "system": {
                 "tensorflow_version": tf.__version__,
-                "google_drive_accessible": gdrive_ok,
+                "google_drive": gdrive_status,
                 "training_in_progress": training_in_progress
             }
         })
