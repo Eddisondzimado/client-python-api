@@ -12,7 +12,7 @@ import logging
 import time
 from datetime import datetime
 import gc
-import threading  # Added missing import
+import threading
 
 # Configure logging
 logging.basicConfig(
@@ -92,6 +92,17 @@ try:
                 logger.error(f"Failed to download {remote_name}: {e}")
                 return False
 
+        def file_exists(self, remote_name):
+            """Check if a file exists on Google Drive"""
+            try:
+                query = f"name='{remote_name}' and '{self.folder_id}' in parents and trashed=false"
+                results = self.service.files().list(q=query, fields="files(id, name)").execute()
+                files = results.get('files', [])
+                return len(files) > 0
+            except Exception as e:
+                logger.error(f"Error checking file existence: {e}")
+                return False
+
     # Initialize Google Drive manager
     try:
         gdrive_manager = GoogleDriveManager()
@@ -135,7 +146,7 @@ class Config:
 class ModelCache:
     """In-memory cache for loaded models"""
     _cache = {}
-    _lock = threading.Lock()  # Fixed: threading is now imported
+    _lock = threading.Lock()
 
     @classmethod
     def get(cls, client_id):
@@ -381,6 +392,96 @@ def predict():
             "error": "Internal Server Error",
             "message": "Failed to process request"
         }), 500
+
+@app.route("/check-models", methods=["GET"])
+def check_models():
+    """Model verification endpoint"""
+    try:
+        client_id = request.args.get("clientId")
+        model_dir = os.path.join('data', 'models', client_id if client_id else 'global')
+        os.makedirs(model_dir, exist_ok=True)
+
+        required_files = Config.get_model_files(client_id)
+        existing, missing = {}, []
+        
+        for name, path in required_files.items():
+            if os.path.exists(path):
+                existing[name] = {"size": os.path.getsize(path)}
+            else:
+                missing.append(name)
+
+        if missing:
+            return jsonify({
+                "status": "error",
+                "message": "Model files incomplete",
+                "missing_files": missing
+            }), 404
+
+        # Verify file integrity
+        try:
+            tf.keras.models.load_model(required_files["model"])
+            with open(required_files["tokenizer"], "rb") as f:
+                pickle.load(f)
+            with open(required_files["labels"], "rb") as f:
+                pickle.load(f)
+                
+            return jsonify({
+                "status": "success",
+                "model_status": "ready",
+                "files": existing
+            })
+            
+        except Exception as e:
+            return jsonify({
+                "status": "error",
+                "model_status": "corrupted",
+                "error": str(e)
+            }), 500
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e)
+        }), 500
+
+@app.route("/check-data", methods=["GET"])
+def check_data():
+    """Check if training data exists"""
+    conn = None
+    try:
+        client_id = request.args.get("clientId")
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({
+                "status": "error",
+                "message": "Database connection failed"
+            }), 500
+            
+        query = "SELECT COUNT(*) as count FROM chatbot_intents WHERE user_token = %s OR user_token IS NULL"
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute(query, (client_id,))
+            result = cursor.fetchone()
+            
+        if result["count"] > 0:
+            return jsonify({
+                "status": "success",
+                "message": "Data available",
+                "count": result["count"]
+            })
+        else:
+            return jsonify({
+                "status": "error",
+                "message": "No training data found"
+            }), 404
+            
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+    finally:
+        if conn:
+            conn.close()
 
 @app.route("/health", methods=["GET"])
 def health_check():
