@@ -13,6 +13,8 @@ import time
 from datetime import datetime
 import gc
 import threading
+import subprocess
+import uuid
 
 # Configure logging
 logging.basicConfig(
@@ -31,6 +33,10 @@ tf.get_logger().setLevel('ERROR')
 
 app = Flask(__name__)
 CORS(app)
+
+# Global training status
+training_in_progress = False
+training_lock = threading.Lock()
 
 # Google Drive Configuration
 GOOGLE_DRIVE_ENABLED = False
@@ -121,6 +127,7 @@ class Config:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     MODELS_DIR = os.path.join('data', 'models')
     MIN_CONFIDENCE = 0.05
+    TRAINING_TIMEOUT = 600  # 10 minutes
 
     # Database configuration
     DB_HOST = os.environ.get('DB_HOST', '104.243.44.92')
@@ -342,9 +349,81 @@ def get_response(intent, client_id=None):
         if conn:
             conn.close()
 
-@app.route("/predict", methods=["POST"])
+def _run_training(client_id, training_id):
+    """Training process with memory optimization"""
+    global training_in_progress
+    
+    try:
+        model_dir = os.path.join('data', 'models', client_id if client_id else 'global')
+        os.makedirs(model_dir, exist_ok=True)
+        
+        ModelCache.clear()
+        
+        cmd = ["python", "train.py"]
+        if client_id:
+            cmd.extend(["--client-id", client_id])
+        
+        process = subprocess.Popen(
+            cmd,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        try:
+            stdout, stderr = process.communicate(timeout=Config.TRAINING_TIMEOUT)
+            
+            if process.returncode != 0:
+                raise Exception(stderr or stdout or "Training failed")
+                
+            # Verify output files
+            required_files = [
+                os.path.join(model_dir, "model.keras"),
+                os.path.join(model_dir, "tokenizer.pkl"),
+                os.path.join(model_dir, "labels.pkl")
+            ]
+            
+            if any(not os.path.exists(f) for f in required_files):
+                raise Exception("Missing output files")
+                
+            logger.info("Training completed successfully")
+            
+            # Load into cache
+            try:
+                with tf.device('/cpu:0'):
+                    model = tf.keras.models.load_model(required_files[0], compile=False)
+                    with open(required_files[1], "rb") as f:
+                        tokenizer = pickle.load(f)
+                    with open(required_files[2], "rb") as f:
+                        labels = pickle.load(f)
+                    
+                    ModelCache.set(client_id or "global", "main", model, tokenizer, labels)
+                    
+            except Exception as e:
+                logger.error(f"Failed to cache model: {e}")
+                
+        except subprocess.TimeoutExpired:
+            process.kill()
+            raise Exception("Training timed out")
+            
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+        # Clean up partial files
+        for f in required_files:
+            if os.path.exists(f):
+                os.remove(f)
+        raise
+    finally:
+        training_in_progress = False
+        gc.collect()
+
+@app.route("/predict", methods=["POST", "OPTIONS"])
 def predict():
     """Prediction endpoint"""
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+    
     if request.content_type != 'application/json':
         return jsonify({
             "error": "Unsupported Media Type",
@@ -392,6 +471,67 @@ def predict():
             "error": "Internal Server Error",
             "message": "Failed to process request"
         }), 500
+
+@app.route("/train", methods=["POST", "OPTIONS"])
+def start_training():
+    """Initiate training process"""
+    global training_in_progress
+    
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+        
+    try:
+        data = request.get_json()
+        if not data or not isinstance(data, dict):
+            return jsonify({
+                "status": "error",
+                "message": "Invalid request data"
+            }), 400
+            
+        client_id = data.get("clientId")
+        
+        with training_lock:
+            if training_in_progress:
+                return jsonify({
+                    "status": "error",
+                    "message": "Training already in progress"
+                }), 429
+
+            training_id = str(uuid.uuid4())
+            training_in_progress = True
+            
+            threading.Thread(
+                target=_run_training,
+                args=(client_id, training_id),
+                daemon=True
+            ).start()
+            
+            return jsonify({
+                "status": "started",
+                "message": "Training initiated successfully",
+                "training_id": training_id,
+                "details": {
+                    "client_id": client_id,
+                    "start_time": datetime.now().isoformat()
+                }
+            })
+
+    except Exception as e:
+        logger.error(f"Training initialization failed: {e}")
+        training_in_progress = False
+        return jsonify({
+            "status": "error",
+            "message": "Failed to start training"
+        }), 500
+
+@app.route("/training-status", methods=["GET"])
+def check_training_status():
+    """Check if training is complete"""
+    with training_lock:
+        return jsonify({
+            "status": "success" if not training_in_progress else "running",
+            "message": "Training completed successfully" if not training_in_progress else "Training in progress"
+        })
 
 @app.route("/check-models", methods=["GET"])
 def check_models():
@@ -507,7 +647,8 @@ def health_check():
             "timestamp": datetime.now().isoformat(),
             "system": {
                 "tensorflow_version": tf.__version__,
-                "google_drive_accessible": gdrive_ok
+                "google_drive_accessible": gdrive_ok,
+                "training_in_progress": training_in_progress
             }
         })
     except Exception as e:
