@@ -723,6 +723,7 @@ def upload_to_gdrive():
         for file_type, path in model_files.items():
             if not os.path.exists(path):
                 missing_files.append(file_type)
+                logger.error(f"Missing file: {path}")
         
         if missing_files:
             return jsonify({
@@ -763,6 +764,9 @@ def upload_to_gdrive():
                             "message": f"Failed to upload {remote_name}"
                         }
             except Exception as e:
+                logger.error(f"Error in upload process for {remote_name}: {str(e)}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
                 upload_results[file_type] = {
                     "status": "error",
                     "message": f"Error uploading {remote_name}: {str(e)}"
@@ -780,11 +784,12 @@ def upload_to_gdrive():
         
     except Exception as e:
         logger.error(f"Google Drive upload failed: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return jsonify({
             "status": "error",
             "message": f"Google Drive upload failed: {str(e)}"
         }), 500
-
 @app.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint"""
