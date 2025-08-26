@@ -86,7 +86,7 @@ try:
                     'parents': [self.folder_id]
                 }
                 
-                media = MediaFileUpload(local_path)  # This requires MediaFileUpload import
+                media = MediaFileUpload(local_path)
                 file = self.service.files().create(
                     body=file_metadata,
                     media_body=media,
@@ -101,6 +101,32 @@ try:
                 logger.error(f"Failed to upload {remote_name}: {e}")
                 return None
 
+        def download_file(self, remote_name, local_path):
+            """Download a file from Google Drive"""
+            try:
+                query = f"name='{remote_name}' and '{self.folder_id}' in parents and trashed=false"
+                results = self.service.files().list(q=query, fields="files(id, name)").execute()
+                files = results.get('files', [])
+                
+                if not files:
+                    raise FileNotFoundError(f"File {remote_name} not found")
+                
+                file_id = files[0]['id']
+                request = self.service.files().get_media(fileId=file_id)
+                
+                with open(local_path, 'wb') as f:
+                    downloader = MediaIoBaseDownload(f, request)
+                    done = False
+                    while not done:
+                        _, done = downloader.next_chunk()
+                
+                logger.info(f"Downloaded {remote_name}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Failed to download {remote_name}: {e}")
+                return False
+
         def file_exists(self, remote_name):
             """Check if a file exists on Google Drive"""
             try:
@@ -111,7 +137,6 @@ try:
             except Exception as e:
                 logger.error(f"Error checking file existence: {e}")
                 return False
-
     # Initialize Google Drive manager
     try:
         gdrive_manager = GoogleDriveManager()
