@@ -53,11 +53,15 @@ try:
             try:
                 creds_json = os.environ.get('GOOGLE_DRIVE_CREDENTIALS')
                 if not creds_json:
-                    raise ValueError("GOOGLE_DRIVE_CREDENTIALS not set")
+                    logger.warning("GOOGLE_DRIVE_CREDENTIALS not set, Google Drive integration disabled")
+                    self.enabled = False
+                    return
                 
                 self.folder_id = os.environ.get('GOOGLE_DRIVE_FOLDER_ID')
                 if not self.folder_id:
-                    raise ValueError("GOOGLE_DRIVE_FOLDER_ID not set")
+                    logger.warning("GOOGLE_DRIVE_FOLDER_ID not set, Google Drive integration disabled")
+                    self.enabled = False
+                    return
                 
                 self.credentials_info = json.loads(creds_json)
                 self.credentials = service_account.Credentials.from_service_account_info(
@@ -66,14 +70,19 @@ try:
                 )
                 
                 self.service = build('drive', 'v3', credentials=self.credentials)
+                self.enabled = True
                 logger.info("Google Drive manager initialized")
                 
             except Exception as e:
                 logger.error(f"Failed to initialize Google Drive: {e}")
-                raise
+                self.enabled = False
         
         def upload_file(self, local_path, remote_name):
             """Upload a file to Google Drive"""
+            if not self.enabled:
+                logger.warning("Google Drive not enabled, skipping upload")
+                return None
+                
             try:
                 if not os.path.exists(local_path):
                     logger.error(f"Local file not found: {local_path}")
@@ -117,6 +126,10 @@ try:
 
         def download_file(self, remote_name, local_path):
             """Download a file from Google Drive"""
+            if not self.enabled:
+                logger.warning("Google Drive not enabled, skipping download")
+                return False
+                
             try:
                 query = f"name='{remote_name}' and '{self.folder_id}' in parents and trashed=false"
                 results = self.service.files().list(q=query, fields="files(id, name)").execute()
@@ -143,6 +156,9 @@ try:
 
         def file_exists(self, remote_name):
             """Check if a file exists on Google Drive"""
+            if not self.enabled:
+                return False
+                
             try:
                 query = f"name='{remote_name}' and '{self.folder_id}' in parents and trashed=false"
                 results = self.service.files().list(q=query, fields="files(id, name)").execute()
@@ -154,15 +170,18 @@ try:
     # Initialize Google Drive manager
     try:
         gdrive_manager = GoogleDriveManager()
-        GOOGLE_DRIVE_ENABLED = True
-        logger.info("Google Drive integration enabled")
+        GOOGLE_DRIVE_ENABLED = gdrive_manager.enabled
+        logger.info(f"Google Drive integration enabled: {GOOGLE_DRIVE_ENABLED}")
     except Exception as e:
         logger.warning(f"Google Drive initialization failed: {e}")
+        GOOGLE_DRIVE_ENABLED = False
 
 except ImportError:
     logger.warning("Google Drive dependencies not available")
+    GOOGLE_DRIVE_ENABLED = False
 except Exception as e:
     logger.warning(f"Error loading Google Drive: {e}")
+    GOOGLE_DRIVE_ENABLED = False
 
 class Config:
     """Application configuration"""
@@ -221,7 +240,8 @@ class ModelCache:
 
 def download_from_google_drive(client_id):
     """Download model files from Google Drive"""
-    if not GOOGLE_DRIVE_ENABLED:
+    if not GOOGLE_DRIVE_ENABLED or not gdrive_manager or not gdrive_manager.enabled:
+        logger.warning("Google Drive not enabled, skipping download")
         return False
     
     try:
@@ -281,7 +301,7 @@ def ensure_model_loaded(client_id):
     
     # Download from Google Drive if available
     try:
-        if gdrive_manager and download_from_google_drive(client_id):
+        if download_from_google_drive(client_id):
             model_data = load_model_from_disk(client_id)
             if model_data:
                 ModelCache.set(client_id, *model_data)
@@ -542,6 +562,8 @@ def start_training():
             training_id = str(uuid.uuid4())
             training_in_progress = True
             
+            # For Heroku, we need to run training in a separate process
+            # This will work with a worker dyno but not with web dyno
             threading.Thread(
                 target=_run_training,
                 args=(client_id, training_id),
@@ -683,7 +705,7 @@ def check_gdrive_status():
         client_id = request.args.get("clientId")
         prefix = "global" if not client_id else f"client_{client_id}"
         
-        if not GOOGLE_DRIVE_ENABLED:
+        if not GOOGLE_DRIVE_ENABLED or not gdrive_manager or not gdrive_manager.enabled:
             return jsonify({
                 "status": "error",
                 "message": "Google Drive integration not enabled. Please check environment variables.",
@@ -747,7 +769,7 @@ def upload_to_gdrive():
             
         client_id = data.get("clientId")
         
-        if not GOOGLE_DRIVE_ENABLED:
+        if not GOOGLE_DRIVE_ENABLED or not gdrive_manager or not gdrive_manager.enabled:
             return jsonify({
                 "status": "error",
                 "message": "Google Drive integration not enabled"
@@ -834,7 +856,7 @@ def upload_to_gdrive():
 def gdrive_debug():
     """Debug Google Drive connection"""
     try:
-        if not GOOGLE_DRIVE_ENABLED:
+        if not GOOGLE_DRIVE_ENABLED or not gdrive_manager or not gdrive_manager.enabled:
             return jsonify({
                 "status": "error",
                 "message": "Google Drive not enabled"
@@ -922,7 +944,7 @@ def health_check():
             "error": None
         }
         
-        if GOOGLE_DRIVE_ENABLED:
+        if GOOGLE_DRIVE_ENABLED and gdrive_manager and gdrive_manager.enabled:
             try:
                 gdrive_manager.service.files().list(pageSize=1).execute()
                 gdrive_status["connected"] = True
