@@ -81,6 +81,10 @@ try:
                     logger.error(f"Local file not found: {local_path}")
                     return None
                 
+                # Check file size and permissions
+                file_size = os.path.getsize(local_path)
+                logger.info(f"Uploading {remote_name} (size: {file_size} bytes)")
+                
                 file_metadata = {
                     'name': remote_name,
                     'parents': [self.folder_id]
@@ -99,6 +103,18 @@ try:
                 
             except Exception as e:
                 logger.error(f"Failed to upload {remote_name}: {e}")
+                # Add more detailed error information
+                import traceback
+                logger.error(f"Upload error traceback: {traceback.format_exc()}")
+                
+                # Check specific error types
+                if "insufficientFilePermissions" in str(e):
+                    logger.error("Service account doesn't have permission to write to this folder")
+                elif "notFound" in str(e):
+                    logger.error("Folder not found or service account doesn't have access")
+                elif "quota" in str(e).lower():
+                    logger.error("Google Drive quota exceeded")
+                
                 return None
 
         def download_file(self, remote_name, local_path):
@@ -814,6 +830,79 @@ def upload_to_gdrive():
         return jsonify({
             "status": "error",
             "message": f"Google Drive upload failed: {str(e)}"
+        }), 500
+
+
+@app.route("/gdrive-debug", methods=["GET"])
+def gdrive_debug():
+    """Debug Google Drive connection"""
+    try:
+        if not GOOGLE_DRIVE_ENABLED:
+            return jsonify({
+                "status": "error",
+                "message": "Google Drive not enabled"
+            }), 500
+        
+        # Test basic connectivity
+        try:
+            results = gdrive_manager.service.files().list(
+                pageSize=1,
+                fields="files(id, name)"
+            ).execute()
+            files = results.get('files', [])
+            connectivity = True
+        except Exception as e:
+            connectivity = False
+            connectivity_error = str(e)
+        
+        # Test folder access
+        try:
+            folder_info = gdrive_manager.service.files().get(
+                fileId=gdrive_manager.folder_id,
+                fields="id, name, mimeType, permissions"
+            ).execute()
+            folder_access = True
+        except Exception as e:
+            folder_access = False
+            folder_error = str(e)
+        
+        # Test file upload with a small test file
+        test_upload = False
+        try:
+            # Create a small test file
+            test_content = "Google Drive test file"
+            test_path = "/tmp/test_upload.txt"
+            with open(test_path, 'w') as f:
+                f.write(test_content)
+            
+            file_id = gdrive_manager.upload_file(test_path, "test_upload.txt")
+            if file_id:
+                test_upload = True
+                # Clean up test file
+                gdrive_manager.service.files().delete(fileId=file_id).execute()
+            
+            # Remove local test file
+            if os.path.exists(test_path):
+                os.remove(test_path)
+                
+        except Exception as e:
+            test_upload_error = str(e)
+        
+        return jsonify({
+            "status": "success",
+            "connectivity": connectivity,
+            "connectivity_error": connectivity_error if not connectivity else None,
+            "folder_access": folder_access,
+            "folder_error": folder_error if not folder_access else None,
+            "folder_id": gdrive_manager.folder_id,
+            "test_upload": test_upload,
+            "test_upload_error": test_upload_error if not test_upload else None
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Debug failed: {str(e)}"
         }), 500
 @app.route("/health", methods=["GET"])
 def health_check():
