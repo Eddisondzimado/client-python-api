@@ -43,12 +43,10 @@ GOOGLE_DRIVE_ENABLED = False
 gdrive_manager = None
 
 # Try to import Google Drive dependencies
-
-# Try to import Google Drive dependencies
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload  # ADD MediaFileUpload
+    from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
     
     class GoogleDriveManager:
         def __init__(self):
@@ -238,7 +236,6 @@ def download_from_google_drive(client_id):
             ("tokenizer", f"{prefix}_tokenizer.pkl"),
             ("labels", f"{prefix}_labels.pkl")
         ]:
-            # FIXED: Changed download_file to download_file (singular)
             if not gdrive_manager.download_file(remote_name, model_files[file_type]):
                 success = False
         
@@ -246,6 +243,7 @@ def download_from_google_drive(client_id):
     except Exception as e:
         logger.error(f"Download failed: {e}")
         return False
+
 def load_model_from_disk(client_id):
     """Load model from disk files"""
     try:
@@ -433,7 +431,7 @@ def _run_training(client_id, training_id):
                 
             logger.info("Training completed successfully")
             
-            # Load into cache - FIXED: Only pass 4 arguments
+            # Load into cache
             try:
                 with tf.device('/cpu:0'):
                     model = tf.keras.models.load_model(required_files[0], compile=False)
@@ -442,7 +440,6 @@ def _run_training(client_id, training_id):
                     with open(required_files[2], "rb") as f:
                         labels = pickle.load(f)
                     
-                    # FIXED: Only pass 4 arguments to set()
                     ModelCache.set(client_id, model, tokenizer, labels)
                     
             except Exception as e:
@@ -868,6 +865,7 @@ def gdrive_debug():
         
         # Test file upload with a small test file
         test_upload = False
+        test_upload_error = None
         try:
             # Create a small test file
             test_content = "Google Drive test file"
@@ -879,7 +877,10 @@ def gdrive_debug():
             if file_id:
                 test_upload = True
                 # Clean up test file
-                gdrive_manager.service.files().delete(fileId=file_id).execute()
+                try:
+                    gdrive_manager.service.files().delete(fileId=file_id).execute()
+                except:
+                    pass  # Ignore cleanup errors
             
             # Remove local test file
             if os.path.exists(test_path):
@@ -904,6 +905,7 @@ def gdrive_debug():
             "status": "error",
             "message": f"Debug failed: {str(e)}"
         }), 500
+
 @app.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint"""

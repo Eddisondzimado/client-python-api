@@ -11,7 +11,7 @@ from tensorflow.keras.preprocessing.sequence import pad_sequences
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
-from collections import defaultdict, Counter  # Fixed import
+from collections import defaultdict, Counter
 import mysql.connector
 import logging
 import argparse
@@ -85,6 +85,10 @@ class GoogleDriveManager:
                 logger.error(f"Local file not found: {local_path}")
                 return None
             
+            # Check file size and permissions
+            file_size = os.path.getsize(local_path)
+            logger.info(f"Uploading {remote_name} (size: {file_size} bytes)")
+            
             file_metadata = {
                 'name': remote_name,
                 'parents': [self.folder_id]
@@ -101,6 +105,16 @@ class GoogleDriveManager:
             logger.info(f"Uploaded {remote_name} to Google Drive with ID: {file_id}")
             return file_id
             
+        except HttpError as e:
+            logger.error(f"Google API error uploading {remote_name}: {e}")
+            # Check specific error types
+            if "insufficientFilePermissions" in str(e):
+                logger.error("Service account doesn't have permission to write to this folder")
+            elif "notFound" in str(e):
+                logger.error("Folder not found or service account doesn't have access")
+            elif "quota" in str(e).lower():
+                logger.error("Google Drive quota exceeded")
+            return None
         except Exception as e:
             logger.error(f"Failed to upload {remote_name}: {e}")
             return None
