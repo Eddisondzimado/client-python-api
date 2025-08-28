@@ -1,5 +1,0 @@
-*.log
-*.csv
-data/raw/
-checkpoints/
-__pycache__/
