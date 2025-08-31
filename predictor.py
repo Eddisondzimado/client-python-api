@@ -60,7 +60,7 @@ class Config:
     DB_HOST = os.environ.get('DB_HOST', '104.243.44.92')
     DB_NAME = os.environ.get('DB_NAME', 'eddcode1_aidexchatbot')
     DB_USER = os.environ.get('DB_USER', 'eddcode1_talkbot')
-    DB_PASS = os.environ.get('DB_PASS', '(ruaN^{r)7I&')
+    DB_PASS = os.environ.get('DB_PASS', 'ZS.nxgC^&9%Bc4E8')
     DB_PORT = int(os.environ.get('DB_PORT', 3306))
     
     # GCS configuration

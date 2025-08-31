@@ -45,7 +45,7 @@ DB_CONFIG = {
     'host': os.getenv('DB_HOST', '104.243.44.92'),
     'database': os.getenv('DB_NAME', 'eddcode1_aidexchatbot'),
     'user': os.getenv('DB_USER', 'eddcode1_talkbot'),
-    'password': os.getenv('DB_PASS', '(ruaN^{r)7I&'),
+    'password': os.getenv('DB_PASS', 'ZS.nxgC^&9%Bc4E8'),
     'port': int(os.getenv('DB_PORT', 3306))
 }
 
