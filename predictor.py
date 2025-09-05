@@ -707,20 +707,36 @@ def predict():
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
     
-    # Check Content-Type header
-    if request.content_type != 'application/json':
+    # More flexible Content-Type handling
+    content_type = request.content_type or ''
+    if not ('application/json' in content_type or 
+            (request.get_data() and not content_type)):
         return jsonify({
             "error": "Unsupported Media Type",
-            "message": "Content-Type must be application/json"
+            "message": "Content-Type must be application/json or empty with JSON data",
+            "received_content_type": content_type
         }), 415
     
     try:
-        data = request.get_json()
-        if not data:
+        # Try to parse JSON data with better error handling
+        try:
+            if request.get_data():
+                data = request.get_json()
+            else:
+                data = {}
+        except Exception as e:
             return jsonify({
-                "error": "Bad Request",
-                "message": "No JSON data received"
+                "error": "Invalid JSON",
+                "message": "Failed to parse JSON data",
+                "details": str(e)
             }), 400
+            
+        if not data:
+            # Also try to get data from form data as fallback
+            data = {
+                "msg": request.form.get("msg", ""),
+                "clientId": request.form.get("clientId")
+            }
             
         msg = data.get("msg", "").strip()
         client_id = data.get("clientId")
