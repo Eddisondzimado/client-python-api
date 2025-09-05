@@ -68,11 +68,11 @@ class Config:
     DB_USER = os.environ.get('DB_USER', 'eddcode1_talkbot')
     DB_PASS = os.environ.get('DB_PASS', 'ZS.nxgC^&9%Bc4E8')
     DB_PORT = int(os.environ.get('DB_PORT', 3306))
-    DB_POOL_SIZE = int(os.environ.get('DB_POOL_SIZE', 10))  # Increased pool size
+    DB_POOL_SIZE = int(os.environ.get('DB_POOL_SIZE', 5))
     DB_POOL_RECYCLE = int(os.environ.get('DB_POOL_RECYCLE', 3600))
     
-    # GCS configuration
-    GCS_BUCKET_NAME = os.environ.get('GCS_BUCKET_NAME', 'client-chatbot-api-models')
+    # GCS configuration - UPDATED with your bucket name
+    GCS_BUCKET_NAME = os.environ.get('GCS_BUCKET_NAME', 'client-support-chatbot-api.appspot.com')
     
     # Cache configuration
     CACHE_TIMEOUT = int(os.environ.get('CACHE_TIMEOUT', 300))  # 5 minutes
@@ -111,7 +111,7 @@ response_cache = {}
 cache_lock = threading.Lock()
 
 def init_db_pool():
-    """Initialize database connection pool"""
+    """Initialize database connection pool with proper MySQL 8+ configuration"""
     global db_pool
     try:
         db_pool = mysql.connector.pooling.MySQLConnectionPool(
@@ -123,14 +123,81 @@ def init_db_pool():
             user=Config.DB_USER,
             password=Config.DB_PASS,
             port=Config.DB_PORT,
-            connection_timeout=3,  # Reduced timeout
+            connection_timeout=5,
+            connect_timeout=5,
+            auth_plugin='mysql_native_password',  # Important for MySQL 8+
             autocommit=True,
-            pool_timeout=5  # Added pool timeout
+            use_pure=True  # Use pure Python implementation for better compatibility
         )
         logger.info(f"Database connection pool initialized with {Config.DB_POOL_SIZE} connections")
+        return True
+    except mysql.connector.Error as err:
+        logger.error(f"MySQL Error initializing pool: {err}")
+        logger.error(f"Error code: {err.errno}, SQL state: {err.sqlstate}")
+        return False
     except Exception as e:
         logger.error(f"Failed to initialize database pool: {e}")
-        db_pool = None
+        return False
+
+def test_db_connection_direct():
+    """Test database connection directly (bypass pool)"""
+    try:
+        connection = mysql.connector.connect(
+            host=Config.DB_HOST,
+            database=Config.DB_NAME,
+            user=Config.DB_USER,
+            password=Config.DB_PASS,
+            port=Config.DB_PORT,
+            connection_timeout=5,
+            auth_plugin='mysql_native_password',
+            use_pure=True
+        )
+        if connection.is_connected():
+            db_info = connection.get_server_info()
+            logger.info(f"Direct database connection successful. MySQL server version: {db_info}")
+            connection.close()
+            return True
+        return False
+    except mysql.connector.Error as err:
+        logger.error(f"MySQL Direct Connection Error: {err}")
+        logger.error(f"Error code: {err.errno}, SQL state: {err.sqlstate}")
+        return False
+    except Exception as e:
+        logger.error(f"Direct database connection test failed: {e}")
+        return False
+
+def get_db_connection():
+    """Get database connection from pool with retry logic"""
+    global db_pool
+    
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            if db_pool is None:
+                if not init_db_pool():
+                    return None
+            
+            connection = db_pool.get_connection()
+            if connection.is_connected():
+                return connection
+            else:
+                logger.warning(f"Got connection from pool but it's not connected (attempt {attempt + 1})")
+                
+        except mysql.connector.Error as err:
+            logger.error(f"MySQL Error getting connection (attempt {attempt + 1}): {err}")
+            # Reinitialize pool on error
+            if attempt == max_retries - 1:  # Last attempt
+                logger.error("All connection attempts failed")
+                return None
+            time.sleep(0.5)  # Wait before retry
+            
+        except Exception as e:
+            logger.error(f"Failed to get connection from pool (attempt {attempt + 1}): {e}")
+            if attempt == max_retries - 1:  # Last attempt
+                return None
+            time.sleep(0.5)  # Wait before retry
+    
+    return None
 
 class GoogleCloudStorageManager:
     def __init__(self):
@@ -161,7 +228,7 @@ class GoogleCloudStorageManager:
                 # Use default credentials (when running on Google Cloud)
                 self.client = storage.Client()
             
-            # Get bucket
+            # Get bucket - USING YOUR BUCKET NAME
             self.bucket = self.client.bucket(Config.GCS_BUCKET_NAME)
             if not self.bucket.exists():
                 logger.warning(f"Bucket {Config.GCS_BUCKET_NAME} does not exist")
@@ -218,19 +285,6 @@ class GoogleCloudStorageManager:
 
 # Initialize GCS manager
 gcs_manager = GoogleCloudStorageManager() if GCS_AVAILABLE else None
-
-def get_db_connection():
-    """Get database connection from pool with retry logic"""
-    if not db_pool:
-        init_db_pool()  # Try to reinitialize if pool is None
-        if not db_pool:
-            return None
-            
-    try:
-        return db_pool.get_connection()
-    except Exception as e:
-        logger.error(f"Failed to get connection from pool: {e}")
-        return None
 
 class ModelCache:
     """In-memory cache for loaded models with TTL"""
@@ -325,6 +379,8 @@ def preload_models():
         finally:
             if conn and conn.is_connected():
                 conn.close()
+    else:
+        logger.warning("Skipping model preloading - no database connection")
     
     logger.info("Model preloading completed")
 
