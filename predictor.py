@@ -1,4 +1,3 @@
-
 import os
 import json
 import pickle
@@ -351,20 +350,26 @@ def preload_models():
     """Preload models on startup to reduce first request latency"""
     logger.info("Preloading models...")
     
-    # Get all client IDs from database
+    # Always try to load the global model at minimum
+    try:
+        ensure_model_loaded(None)
+        logger.info("Preloaded global model")
+    except Exception as e:
+        logger.error(f"Failed to preload global model: {e}")
+    
+    # Try to load client models from database if available
     conn = get_db_connection()
     if conn:
         try:
             cursor = conn.cursor()
             cursor.execute("SELECT DISTINCT user_token FROM chatbot_intents WHERE user_token IS NOT NULL")
             client_ids = [row[0] for row in cursor.fetchall()]
-            client_ids.append(None)  # Add global model
             
-            # Preload each model
-            for client_id in client_ids[:3]:  # Limit to first 3 to avoid overload
+            # Preload each model (limit to avoid overload)
+            for client_id in client_ids[:2]:
                 try:
                     ensure_model_loaded(client_id)
-                    logger.info(f"Preloaded model for client: {client_id or 'global'}")
+                    logger.info(f"Preloaded model for client: {client_id}")
                 except Exception as e:
                     logger.error(f"Failed to preload model for {client_id}: {e}")
                     
@@ -377,39 +382,51 @@ def preload_models():
                 except Exception as e:
                     logger.warning(f"Error closing connection: {str(e)}")
     else:
-        logger.warning("Cannot preload models - database connection failed")
+        logger.warning("Cannot preload client models - database connection failed")
     
     logger.info("Model preloading completed")
 
 def ensure_model_loaded(client_id):
     """Ensure model is loaded, try cache first, then disk, then GCS"""
-    # Check if model is in cache
-    cached = ModelCache.get(client_id or "global", "main")
-    if cached:
-        return cached
-    
-    # Try to load from disk
-    model_data = load_model_from_disk(client_id)
-    if model_data:
-        ModelCache.set(client_id or "global", "main", *model_data)
-        return model_data
-    
-    # Try to download from Google Cloud Storage
-    if gcs_manager and gcs_manager.enabled:
-        try:
-            if gcs_manager.download_model(client_id):
-                model_data = load_model_from_disk(client_id)
-                if model_data:
-                    ModelCache.set(client_id or "global", "main", *model_data)
-                    return model_data
-        except Exception as e:
-            logger.error(f"Failed to download from GCS: {e}")
-    
-    # If client-specific model fails, try global model
-    if client_id:
-        return ensure_model_loaded(None)
-    
-    return None
+    try:
+        # Check if model is in cache
+        cached = ModelCache.get(client_id or "global", "main")
+        if cached:
+            logger.info(f"Using cached model for client: {client_id}")
+            return cached
+        
+        # Try to load from disk
+        model_data = load_model_from_disk(client_id)
+        if model_data:
+            ModelCache.set(client_id or "global", "main", *model_data)
+            logger.info(f"Loaded model from disk for client: {client_id}")
+            return model_data
+        
+        # Try to download from Google Cloud Storage
+        if gcs_manager and gcs_manager.enabled:
+            try:
+                logger.info(f"Attempting to download model from GCS for client: {client_id}")
+                if gcs_manager.download_model(client_id):
+                    model_data = load_model_from_disk(client_id)
+                    if model_data:
+                        ModelCache.set(client_id or "global", "main", *model_data)
+                        logger.info(f"Downloaded and loaded model from GCS for client: {client_id}")
+                        return model_data
+            except Exception as e:
+                logger.error(f"Failed to download from GCS: {e}")
+        
+        # If client-specific model fails, try global model (but only if we were trying a specific client)
+        if client_id:
+            logger.info(f"Falling back to global model for client: {client_id}")
+            return ensure_model_loaded(None)
+        
+        logger.error("No model available - both client-specific and global models failed to load")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error in ensure_model_loaded: {e}")
+        logger.error(traceback.format_exc())
+        return None
 
 def clean_text(text):
     """Clean and preprocess text for better prediction"""
@@ -423,7 +440,6 @@ def clean_text(text):
     text = re.sub(r'[^\w\s\?\.\!]', '', text)
     
     return text
-
 
 def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
     """Predict intent from message with optimized processing"""
