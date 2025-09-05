@@ -321,7 +321,7 @@ def preload_models():
         except Exception as e:
             logger.error(f"Error getting client IDs for preloading: {e}")
         finally:
-            if conn.is_connected():
+            if conn and conn.is_connected():
                 conn.close()
     
     logger.info("Model preloading completed")
@@ -1059,43 +1059,43 @@ def get_training_logs():
             "error": str(e)
         }), 500
 
-@app.route("/check-filesystem", methods["GET"])
-def check_filesystem():
-    """Check the filesystem structure"""
-    try:
-        client_id = request.args.get("clientId")
-        model_dir = Config.get_model_path(client_id)
+# @app.route("/check-filesystem", methods["GET"])
+# def check_filesystem():
+#     """Check the filesystem structure"""
+#     try:
+#         client_id = request.args.get("clientId")
+#         model_dir = Config.get_model_path(client_id)
         
-        # Check if directory exists
-        dir_exists = os.path.exists(model_dir)
+#         # Check if directory exists
+#         dir_exists = os.path.exists(model_dir)
         
-        # List all files in directory
-        files = []
-        if dir_exists:
-            files = os.listdir(model_dir)
+#         # List all files in directory
+#         files = []
+#         if dir_exists:
+#             files = os.listdir(model_dir)
         
-        # Check data directory
-        data_dir = os.path.join('data')
-        data_dir_exists = os.path.exists(data_dir)
-        data_files = []
-        if data_dir_exists:
-            data_files = os.listdir(data_dir)
+#         # Check data directory
+#         data_dir = os.path.join('data')
+#         data_dir_exists = os.path.exists(data_dir)
+#         data_files = []
+#         if data_dir_exists:
+#             data_files = os.listdir(data_dir)
         
-        return jsonify({
-            "status": "success",
-            "model_directory": model_dir,
-            "model_directory_exists": dir_exists,
-            "model_files": files,
-            "data_directory": data_dir,
-            "data_directory_exists": data_dir_exists,
-            "data_files": data_files
-        })
+#         return jsonify({
+#             "status": "success",
+#             "model_directory": model_dir,
+#             "model_directory_exists": dir_exists,
+#             "model_files": files,
+#             "data_directory": data_dir,
+#             "data_directory_exists": data_dir_exists,
+#             "data_files": data_files
+#         })
         
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "error": str(e)
-        }), 500
+#     except Exception as e:
+#         return jsonify({
+#             "status": "error",
+#             "error": str(e)
+#         }), 500
 
 @app.route("/health", methods=["GET"])
 def health_check():
@@ -1175,7 +1175,6 @@ def initialize_app():
     # Start model preloading in background
     def preload_models_async():
         try:
-            time.sleep(2)  # Wait a bit for server to start
             preload_models()
         except Exception as e:
             logger.error(f"Model preloading failed: {e}")
