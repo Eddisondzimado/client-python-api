@@ -703,76 +703,65 @@ def get_response(intent, client_id=None):
 
 @app.route("/predict", methods=["POST", "OPTIONS"])
 def predict():
-    """Prediction endpoint with optimized response"""
+    """Prediction endpoint with support for JSON and form-data"""
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
-    
-    # More flexible Content-Type handling
+
     content_type = request.content_type or ''
-    if not ('application/json' in content_type or 
-            (request.get_data() and not content_type)):
-        return jsonify({
-            "error": "Unsupported Media Type",
-            "message": "Content-Type must be application/json or empty with JSON data",
-            "received_content_type": content_type
-        }), 415
-    
+    logger.info(f"Incoming request Content-Type: {content_type}")
+
     try:
-        # Try to parse JSON data with better error handling
-        try:
-            if request.get_data():
-                data = request.get_json()
-            else:
-                data = {}
-        except Exception as e:
-            return jsonify({
-                "error": "Invalid JSON",
-                "message": "Failed to parse JSON data",
-                "details": str(e)
-            }), 400
-            
-        if not data:
-            # Also try to get data from form data as fallback
+        # Parse request data depending on content type
+        data = {}
+
+        if 'application/json' in content_type:
+            data = request.get_json(force=True, silent=True) or {}
+        elif 'multipart/form-data' in content_type:
             data = {
                 "msg": request.form.get("msg", ""),
                 "clientId": request.form.get("clientId")
             }
-            
-        msg = data.get("msg", "").strip()
+        else:
+            # fallback if raw body JSON but no content-type
+            if request.get_data():
+                try:
+                    data = request.get_json(force=True) or {}
+                except Exception:
+                    pass
+
+        # Validation: must have message
+        msg = (data.get("msg") or "").strip()
         client_id = data.get("clientId")
-        
+
         if not msg:
             return jsonify({
-                "error": "Bad Request", 
+                "error": "Bad Request",
                 "message": "Message cannot be empty"
             }), 400
-            
+
         logger.info(f"Received prediction request: '{msg}' for client: {client_id}")
-        
+
         # Debug: Check if model files exist
         model_files = Config.get_model_files(client_id)
-        logger.info(f"Looking for model files: {model_files}")
-        
         for file_type, file_path in model_files.items():
             exists = os.path.exists(file_path)
             logger.info(f"Model file {file_type}: {file_path} - Exists: {exists}")
             if exists:
-                logger.info(f"File size: {os.path.getsize(file_path) if exists else 0} bytes")
-            
-        # Start prediction - with detailed error handling
+                logger.info(f"File size: {os.path.getsize(file_path)} bytes")
+
+        # Run prediction
         try:
             intent, confidence = predict_intent(msg, client_id)
         except Exception as e:
-            logger.error(f"Prediction failed: {str(e)}")
-            logger.error(traceback.format_exc())
-            # Return a fallback response instead of crashing
+            logger.error(f"Prediction failed: {str(e)}", exc_info=True)
             return jsonify({
                 "response": "I'm having trouble processing your request right now. Please try again.",
                 "intent": "fallback",
                 "confidence": 0.0,
                 "status": "service_error"
             })
-        
+
+        # Handle low confidence
         if confidence < Config.MIN_CONFIDENCE:
             return jsonify({
                 "response": "I'm not quite sure what you mean. Could you rephrase?",
@@ -791,8 +780,7 @@ def predict():
                 "status": response["status"]
             })
         except Exception as e:
-            logger.error(f"Response lookup failed: {str(e)}")
-            # Fallback response if database is unavailable
+            logger.error(f"Response lookup failed: {str(e)}", exc_info=True)
             return jsonify({
                 "response": "I understand what you're asking, but I'm having trouble retrieving the response.",
                 "intent": intent,
@@ -801,8 +789,7 @@ def predict():
             })
 
     except Exception as e:
-        logger.error(f"Unexpected error in predict endpoint: {str(e)}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Unexpected error in predict endpoint: {str(e)}", exc_info=True)
         return jsonify({
             "error": "Internal Server Error",
             "message": "Failed to process request",
