@@ -441,6 +441,22 @@ def clean_text(text):
     
     return text
 
+def cache_response(intent, client_id, response):
+    """Cache a response"""
+    cache_key = f"{client_id or 'global'}:{intent}"
+    with cache_lock:
+        # Implement simple LRU cache eviction if needed
+        if len(response_cache) >= Config.MAX_CACHE_SIZE:
+            # Remove oldest entry
+            oldest_key = min(response_cache.keys(), key=lambda k: response_cache[k]['timestamp'])
+            del response_cache[oldest_key]
+            
+        response_cache[cache_key] = {
+            'response': response,
+            'timestamp': time.time()
+        }
+
+
 def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
     """Predict intent from message with optimized processing"""
     try:
@@ -454,12 +470,22 @@ def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
         
         model, tokenizer, labels = model_data
         
+        # Check if we have valid components
+        if model is None or tokenizer is None or labels is None:
+            logger.error(f"Incomplete model data for client {client_id}")
+            return "fallback", 0.0
+            
         # Preprocess message
         clean_msg = clean_text(msg.lower().strip())
         logger.info(f"Processing message: '{clean_msg}'")
         
         # Process prediction with batch optimization
-        sequence = tokenizer.texts_to_sequences([clean_msg])
+        try:
+            sequence = tokenizer.texts_to_sequences([clean_msg])
+        except Exception as e:
+            logger.error(f"Tokenization failed: {e}")
+            return "fallback", 0.0
+            
         if not sequence or not sequence[0]:
             logger.warning(f"No sequence generated for message: '{clean_msg}'")
             return "fallback", 0.0
@@ -479,7 +505,11 @@ def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
         padded = pad_sequences(sequence, maxlen=max_len, padding='post')
         
         # Make prediction
-        prediction = model.predict(padded, verbose=0, batch_size=1)
+        try:
+            prediction = model.predict(padded, verbose=0, batch_size=1)
+        except Exception as e:
+            logger.error(f"Model prediction failed: {e}")
+            return "fallback", 0.0
         
         confidence = float(np.max(prediction))
         intent_idx = np.argmax(prediction)
@@ -571,21 +601,6 @@ def get_cached_response(intent, client_id):
         if cached_data and time.time() - cached_data['timestamp'] < Config.CACHE_TIMEOUT:
             return cached_data['response']
     return None
-
-def cache_response(intent, client_id, response):
-    """Cache a response"""
-    cache_key = f"{client_id or 'global'}:{intent}"
-    with cache_lock:
-        # Implement simple LRU cache eviction if needed
-        if len(response_cache) >= Config.MAX_CACHE_SIZE:
-            # Remove oldest entry
-            oldest_key = min(response_cache.keys(), key=lambda k: response_cache[k]['timestamp'])
-            del response_cache[oldest_key]
-            
-        response_cache[cache_key] = {
-            'response': response,
-            'timestamp': time.time()
-        }
 
 def get_response(intent, client_id=None):
     """Get response for intent with improved error handling and caching"""
@@ -685,65 +700,8 @@ def get_response(intent, client_id=None):
             except Exception as e:
                 logger.warning(f"Error closing connection: {str(e)}")
 
-def compress_response(f):
-    """Decorator to compress responses with gzip"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        response = f(*args, **kwargs)
-        
-        # Check if client supports gzip
-        accept_encoding = request.headers.get('Accept-Encoding', '')
-        if 'gzip' not in accept_encoding.lower():
-            return response
-        
-        # Compress response data
-        if response.status_code == 200 and response.content_length > 500:  # Only compress larger responses
-            compressed_data = gzip.compress(response.get_data())
-            response.set_data(compressed_data)
-            response.headers['Content-Encoding'] = 'gzip'
-            response.headers['Content-Length'] = len(compressed_data)
-        
-        return response
-    return decorated_function
-
-@app.before_request
-def before_request():
-    """Measure request timing"""
-    request.start_time = time.time()
-
-@app.after_request
-def after_request(response):
-    """Log request timing"""
-    if hasattr(request, 'start_time'):
-        duration = time.time() - request.start_time
-        logger.info(f"Request {request.method} {request.path} took {duration:.3f}s")
-        response.headers['X-Response-Time'] = f'{duration:.3f}s'
-    return response
-
-@app.errorhandler(500)
-def handle_500_error(e):
-    """Handle 500 errors with detailed logging"""
-    logger.error(f"500 Error: {str(e)}")
-    logger.error(traceback.format_exc())
-    return jsonify({
-        "error": "Internal Server Error",
-        "message": "The server encountered an internal error",
-        "status": 500
-    }), 500
-
-@app.errorhandler(Exception)
-def handle_exception(e):
-    """Handle any unhandled exceptions"""
-    logger.error(f"Unhandled exception: {str(e)}")
-    logger.error(traceback.format_exc())
-    return jsonify({
-        "error": "Internal Server Error",
-        "message": "An unexpected error occurred",
-        "status": 500
-    }), 500
 
 @app.route("/predict", methods=["POST", "OPTIONS"])
-@compress_response
 def predict():
     """Prediction endpoint with optimized response"""
     if request.method == "OPTIONS":
@@ -774,6 +732,16 @@ def predict():
             }), 400
             
         logger.info(f"Received prediction request: '{msg}' for client: {client_id}")
+        
+        # Debug: Check if model files exist
+        model_files = Config.get_model_files(client_id)
+        logger.info(f"Looking for model files: {model_files}")
+        
+        for file_type, file_path in model_files.items():
+            exists = os.path.exists(file_path)
+            logger.info(f"Model file {file_type}: {file_path} - Exists: {exists}")
+            if exists:
+                logger.info(f"File size: {os.path.getsize(file_path) if exists else 0} bytes")
             
         # Start prediction - with detailed error handling
         try:
@@ -824,7 +792,8 @@ def predict():
             "message": "Failed to process request",
             "status": 500
         }), 500
-    
+
+
 @app.route("/train", methods=["POST", "OPTIONS"])
 def start_training():
     """Initiate training process with detailed responses"""
@@ -1241,40 +1210,6 @@ def health_check():
             "error": str(e)
         }), 500
 
-@app.route("/cache-stats", methods=["GET"])
-def cache_stats():
-    """Get cache statistics"""
-    with cache_lock:
-        cache_size = len(response_cache)
-        cache_keys = list(response_cache.keys())[:10]  # First 10 keys
-        
-    with ModelCache._lock:
-        model_cache_size = len(ModelCache._cache)
-        model_cache_keys = list(ModelCache._cache.keys())[:5]  # First 5 keys
-    
-    return jsonify({
-        "response_cache": {
-            "size": cache_size,
-            "sample_keys": cache_keys
-        },
-        "model_cache": {
-            "size": model_cache_size,
-            "sample_keys": model_cache_keys
-        }
-    })
-
-@app.route("/clear-cache", methods=["POST"])
-def clear_cache():
-    """Clear all caches"""
-    with cache_lock:
-        response_cache.clear()
-    
-    ModelCache.clear()
-    
-    return jsonify({
-        "status": "success",
-        "message": "All caches cleared"
-    })
 
 # Initialize the application
 def initialize_app():
