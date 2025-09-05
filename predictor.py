@@ -424,9 +424,12 @@ def clean_text(text):
     
     return text
 
+
 def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
     """Predict intent from message with optimized processing"""
     try:
+        logger.info(f"Loading model for client: {client_id}")
+        
         # Get model data
         model_data = ensure_model_loaded(client_id)
         if not model_data:
@@ -437,17 +440,42 @@ def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
         
         # Preprocess message
         clean_msg = clean_text(msg.lower().strip())
+        logger.info(f"Processing message: '{clean_msg}'")
         
         # Process prediction with batch optimization
         sequence = tokenizer.texts_to_sequences([clean_msg])
         if not sequence or not sequence[0]:
+            logger.warning(f"No sequence generated for message: '{clean_msg}'")
             return "fallback", 0.0
+        
+        # Get the actual sequence length from the model
+        try:
+            if hasattr(model, 'input_shape') and model.input_shape:
+                max_len = model.input_shape[1]
+            else:
+                # Fallback to a reasonable default
+                max_len = 20
+                logger.warning(f"Using default max_len: {max_len}")
+        except:
+            max_len = 20
+            logger.warning(f"Error getting max_len, using default: {max_len}")
             
-        padded = pad_sequences(sequence, maxlen=model.input_shape[1], padding='post')
+        padded = pad_sequences(sequence, maxlen=max_len, padding='post')
+        
+        # Make prediction
         prediction = model.predict(padded, verbose=0, batch_size=1)
         
         confidence = float(np.max(prediction))
-        intent = labels[np.argmax(prediction)]
+        intent_idx = np.argmax(prediction)
+        
+        # Check if intent_idx is within bounds
+        if intent_idx < len(labels):
+            intent = labels[intent_idx]
+        else:
+            logger.error(f"Intent index {intent_idx} out of bounds for labels length {len(labels)}")
+            intent = "fallback"
+            
+        logger.info(f"Predicted intent: {intent} with confidence: {confidence}")
         return intent, confidence
         
     except Exception as e:
@@ -731,8 +759,19 @@ def predict():
             
         logger.info(f"Received prediction request: '{msg}' for client: {client_id}")
             
-        # Start prediction
-        intent, confidence = predict_intent(msg, client_id)
+        # Start prediction - with detailed error handling
+        try:
+            intent, confidence = predict_intent(msg, client_id)
+        except Exception as e:
+            logger.error(f"Prediction failed: {str(e)}")
+            logger.error(traceback.format_exc())
+            # Return a fallback response instead of crashing
+            return jsonify({
+                "response": "I'm having trouble processing your request right now. Please try again.",
+                "intent": "fallback",
+                "confidence": 0.0,
+                "status": "service_error"
+            })
         
         if confidence < Config.MIN_CONFIDENCE:
             return jsonify({
@@ -742,22 +781,34 @@ def predict():
                 "status": "low_confidence"
             })
 
-        response = get_response(intent, client_id)
-        return jsonify({
-            "response": response["response"],
-            "intent": intent,
-            "confidence": round(confidence, 2),
-            "status": response["status"]
-        })
+        # Get response from database
+        try:
+            response = get_response(intent, client_id)
+            return jsonify({
+                "response": response["response"],
+                "intent": intent,
+                "confidence": round(confidence, 2),
+                "status": response["status"]
+            })
+        except Exception as e:
+            logger.error(f"Response lookup failed: {str(e)}")
+            # Fallback response if database is unavailable
+            return jsonify({
+                "response": "I understand what you're asking, but I'm having trouble retrieving the response.",
+                "intent": intent,
+                "confidence": round(confidence, 2),
+                "status": "response_error"
+            })
 
     except Exception as e:
-        logger.error(f"Prediction error: {str(e)}")
+        logger.error(f"Unexpected error in predict endpoint: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({
             "error": "Internal Server Error",
-            "message": "Failed to process request"
+            "message": "Failed to process request",
+            "status": 500
         }), 500
-
+    
 @app.route("/train", methods=["POST", "OPTIONS"])
 def start_training():
     """Initiate training process with detailed responses"""
