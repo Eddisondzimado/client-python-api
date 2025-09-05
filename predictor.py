@@ -32,12 +32,13 @@ logger = logging.getLogger(__name__)
 # Configure TensorFlow for optimized performance
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 tf.get_logger().setLevel('ERROR')
 os.makedirs('data/models', exist_ok=True)
 
 # Optimize TensorFlow memory usage
-tf.config.threading.set_inter_op_parallelism_threads(1)
-tf.config.threading.set_intra_op_parallelism_threads(1)
+tf.config.threading.set_inter_op_parallelism_threads(2)
+tf.config.threading.set_intra_op_parallelism_threads(2)
 tf.config.set_soft_device_placement(True)
 
 app = Flask(__name__)
@@ -67,7 +68,7 @@ class Config:
     DB_USER = os.environ.get('DB_USER', 'eddcode1_talkbot')
     DB_PASS = os.environ.get('DB_PASS', 'ZS.nxgC^&9%Bc4E8')
     DB_PORT = int(os.environ.get('DB_PORT', 3306))
-    DB_POOL_SIZE = int(os.environ.get('DB_POOL_SIZE', 5))
+    DB_POOL_SIZE = int(os.environ.get('DB_POOL_SIZE', 10))  # Increased pool size
     DB_POOL_RECYCLE = int(os.environ.get('DB_POOL_RECYCLE', 3600))
     
     # GCS configuration
@@ -78,8 +79,8 @@ class Config:
     MAX_CACHE_SIZE = int(os.environ.get('MAX_CACHE_SIZE', 1000))  # Max cached responses
 
     # Performance settings
-    PREDICTION_TIMEOUT = int(os.environ.get('PREDICTION_TIMEOUT', 5))  # 5 seconds
-    MODEL_PRELOAD_WORKERS = int(os.environ.get('MODEL_PRELOAD_WORKERS', 3))
+    PREDICTION_TIMEOUT = int(os.environ.get('PREDICTION_TIMEOUT', 3))  # 3 seconds timeout
+    MODEL_PRELOAD_WORKERS = int(os.environ.get('MODEL_PRELOAD_WORKERS', 2))
 
     @classmethod
     def get_model_path(cls, client_id=None):
@@ -122,8 +123,9 @@ def init_db_pool():
             user=Config.DB_USER,
             password=Config.DB_PASS,
             port=Config.DB_PORT,
-            connection_timeout=5,
-            autocommit=True
+            connection_timeout=3,  # Reduced timeout
+            autocommit=True,
+            pool_timeout=5  # Added pool timeout
         )
         logger.info(f"Database connection pool initialized with {Config.DB_POOL_SIZE} connections")
     except Exception as e:
@@ -1058,44 +1060,6 @@ def get_training_logs():
             "status": "error",
             "error": str(e)
         }), 500
-
-# @app.route("/check-filesystem", methods["GET"])
-# def check_filesystem():
-#     """Check the filesystem structure"""
-#     try:
-#         client_id = request.args.get("clientId")
-#         model_dir = Config.get_model_path(client_id)
-        
-#         # Check if directory exists
-#         dir_exists = os.path.exists(model_dir)
-        
-#         # List all files in directory
-#         files = []
-#         if dir_exists:
-#             files = os.listdir(model_dir)
-        
-#         # Check data directory
-#         data_dir = os.path.join('data')
-#         data_dir_exists = os.path.exists(data_dir)
-#         data_files = []
-#         if data_dir_exists:
-#             data_files = os.listdir(data_dir)
-        
-#         return jsonify({
-#             "status": "success",
-#             "model_directory": model_dir,
-#             "model_directory_exists": dir_exists,
-#             "model_files": files,
-#             "data_directory": data_dir,
-#             "data_directory_exists": data_dir_exists,
-#             "data_files": data_files
-#         })
-        
-#     except Exception as e:
-#         return jsonify({
-#             "status": "error",
-#             "error": str(e)
-#         }), 500
 
 @app.route("/health", methods=["GET"])
 def health_check():
