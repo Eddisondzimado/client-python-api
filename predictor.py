@@ -73,7 +73,7 @@ class Config:
     DB_POOL_RECYCLE = int(os.environ.get('DB_POOL_RECYCLE', 3600))
     
     # GCS configuration
-    GCS_BUCKET_NAME = os.environ.get('GCS_BUCKET_NAME', 'client-chatbot-api-models')
+    GCS_BUCKET_NAME = os.environ.get('GCS_BUCKET_NAME', 'client-support-chatbot-api.appspot.com')
     
     # Cache configuration
     CACHE_TIMEOUT = int(os.environ.get('CACHE_TIMEOUT', 300))  # 5 minutes
