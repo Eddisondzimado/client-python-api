@@ -1,20 +1,28 @@
 steps:
-  # Build the container image
+  # Build the container image with build args for better caching
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['build', '-t', 'gcr.io/$PROJECT_ID/$_SERVICE_NAME', '.']
+    args: 
+      - 'build'
+      - '--build-arg'
+      - 'PYTHON_VERSION=3.9'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/$_SERVICE_NAME:latest'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/$_SERVICE_NAME:$COMMIT_SHA'
+      - '.'
   
   # Push the container image to Container Registry
   - name: 'gcr.io/cloud-builders/docker'
     args: ['push', 'gcr.io/$PROJECT_ID/$_SERVICE_NAME']
   
-  # Deploy container image to Cloud Run
+  # Deploy container image to Cloud Run with proper service account
   - name: 'gcr.io/cloud-builders/gcloud'
     args:
     - 'run'
     - 'deploy'
     - '$_SERVICE_NAME'
     - '--image'
-    - 'gcr.io/$PROJECT_ID/$_SERVICE_NAME'
+    - 'gcr.io/$PROJECT_ID/$_SERVICE_NAME:$COMMIT_SHA'
     - '--region'
     - '$_REGION'
     - '--platform'
@@ -26,19 +34,42 @@ steps:
     - '2'
     - '--timeout'
     - '3600'
+    - '--concurrency'
+    - '80'
+    - '--max-instances'
+    - '10'
     - '--set-env-vars=GCS_BUCKET_NAME=$_BUCKET_NAME'
-    - '--set-env-vars=DB_HOST=104.243.44.92'
-    - '--set-env-vars=DB_NAME=eddcode1_aidexchatbot'
-    - '--set-env-vars=DB_USER=eddcode1_talkbot'
-    - '--set-env-vars=DB_PASS=sxhrfydhtd57465rd'
-    - '--set-env-vars=DB_PORT=3306'
+    - '--set-env-vars=DB_HOST=$_DB_HOST'
+    - '--set-env-vars=DB_NAME=$_DB_NAME'
+    - '--set-env-vars=DB_USER=$_DB_USER'
+    - '--set-env-vars=DB_PASS=$_DB_PASS'
+    - '--set-env-vars=DB_PORT=$_DB_PORT'
+    - '--set-env-vars=PYTHONUNBUFFERED=True'
+
+  # Wait for deployment to complete and test the endpoint
+  - name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        sleep 30
+        URL=$(gcloud run services describe $_SERVICE_NAME --region=$_REGION --format='value(status.url)')
+        echo "Testing service endpoint: $URL/health"
+        curl -f -H "Authorization: Bearer $(gcloud auth print-identity-token)" $URL/health || exit 1
 
 substitutions:
   _BUCKET_NAME: client-support-chatbot-api.appspot.com
   _SERVICE_NAME: customer-support-api
   _REGION: us-central1
+  _DB_HOST: 104.243.44.92
+  _DB_NAME: eddcode1_aidexchatbot
+  _DB_USER: eddcode1_talkbot
+  _DB_PASS: ZS.nxgC^&9%Bc4E8
+  _DB_PORT: '3306'
 
 options:
   logging: CLOUD_LOGGING_ONLY
+  dynamic_substitutions: true
+  machineType: 'E2_HIGHCPU_8'
 
-images: ['gcr.io/$PROJECT_ID/$_SERVICE_NAME']
+images: ['gcr.io/$PROJECT_ID/$_SERVICE_NAME:latest', 'gcr.io/$PROJECT_ID/$_SERVICE_NAME:$COMMIT_SHA']
