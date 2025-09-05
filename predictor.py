@@ -8,6 +8,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 import mysql.connector
+import mysql.connector.pooling
 import subprocess
 import threading
 import uuid
@@ -15,8 +16,11 @@ import logging
 import time
 from datetime import datetime
 import sys
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 import base64
+import re
+import gzip
+from functools import wraps
 
 # Configure logging
 logging.basicConfig(
@@ -43,11 +47,15 @@ CORS(app)
 try:
     from google.cloud import storage
     from google.oauth2 import service_account
+    from google.api_core.exceptions import GoogleAPIError
     GCS_AVAILABLE = True
     logger.info("Google Cloud Storage libraries available")
 except ImportError:
     logger.warning("Google Cloud Storage libraries not available")
     GCS_AVAILABLE = False
+
+# Thread pool for async operations
+thread_pool = None
 
 class Config:
     """Application configuration"""
@@ -56,16 +64,25 @@ class Config:
     MIN_CONFIDENCE = 0.05
     TRAINING_TIMEOUT = 3600  # 60 minutes
 
-    # Database configuration
+    # Database configuration with connection pooling
     DB_HOST = os.environ.get('DB_HOST', '104.243.44.92')
     DB_NAME = os.environ.get('DB_NAME', 'eddcode1_aidexchatbot')
     DB_USER = os.environ.get('DB_USER', 'eddcode1_talkbot')
     DB_PASS = os.environ.get('DB_PASS', 'ZS.nxgC^&9%Bc4E8')
     DB_PORT = int(os.environ.get('DB_PORT', 3306))
+    DB_POOL_SIZE = int(os.environ.get('DB_POOL_SIZE', 5))
+    DB_POOL_RECYCLE = int(os.environ.get('DB_POOL_RECYCLE', 3600))
     
     # GCS configuration
     GCS_BUCKET_NAME = os.environ.get('GCS_BUCKET_NAME', 'client-chatbot-api-models')
     
+    # Cache configuration
+    CACHE_TIMEOUT = int(os.environ.get('CACHE_TIMEOUT', 300))  # 5 minutes
+    MAX_CACHE_SIZE = int(os.environ.get('MAX_CACHE_SIZE', 1000))  # Max cached responses
+
+    # Performance settings
+    PREDICTION_TIMEOUT = int(os.environ.get('PREDICTION_TIMEOUT', 5))  # 5 seconds
+    MODEL_PRELOAD_WORKERS = int(os.environ.get('MODEL_PRELOAD_WORKERS', 3))
 
     @classmethod
     def get_model_path(cls, client_id=None):
@@ -87,6 +104,44 @@ class Config:
 # Global training status
 training_in_progress = False
 training_lock = threading.Lock()
+
+# Database connection pool
+db_pool = None
+
+# Response cache
+response_cache = {}
+cache_lock = threading.Lock()
+
+def init_db_pool():
+    """Initialize database connection pool"""
+    global db_pool
+    try:
+        db_pool = mysql.connector.pooling.MySQLConnectionPool(
+            pool_name="chatbot_pool",
+            pool_size=Config.DB_POOL_SIZE,
+            pool_reset_session=True,
+            host=Config.DB_HOST,
+            database=Config.DB_NAME,
+            user=Config.DB_USER,
+            password=Config.DB_PASS,
+            port=Config.DB_PORT,
+            connection_timeout=5,
+            autocommit=True
+        )
+        logger.info(f"Database connection pool initialized with {Config.DB_POOL_SIZE} connections")
+    except Exception as e:
+        logger.error(f"Failed to initialize database pool: {e}")
+        db_pool = None
+
+# Initialize DB pool on startup
+init_db_pool()
+
+def init_thread_pool():
+    """Initialize thread pool for async operations"""
+    global thread_pool
+    thread_pool = threading.BoundedSemaphore(Config.MODEL_PRELOAD_WORKERS)
+
+init_thread_pool()
 
 class GoogleCloudStorageManager:
     def __init__(self):
@@ -141,6 +196,9 @@ class GoogleCloudStorageManager:
                 logger.warning(f"File not found in GCS: {remote_path}")
                 return False
                 
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                
             blob.download_to_filename(local_path)
             logger.info(f"Downloaded gs://{Config.GCS_BUCKET_NAME}/{remote_path} to {local_path}")
             return True
@@ -173,29 +231,22 @@ class GoogleCloudStorageManager:
 gcs_manager = GoogleCloudStorageManager() if GCS_AVAILABLE else None
 
 def get_db_connection():
-    """Get database connection with retry logic"""
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            conn = mysql.connector.connect(
-                host=Config.DB_HOST,
-                database=Config.DB_NAME,
-                user=Config.DB_USER,
-                password=Config.DB_PASS,
-                port=Config.DB_PORT,
-                connect_timeout=5
-            )
-            return conn
-        except Exception as e:
-            logger.error(f"DB connection attempt {attempt + 1} failed: {e}")
-            if attempt == max_retries - 1:
-                return None
-            time.sleep(1)
+    """Get database connection from pool with retry logic"""
+    if not db_pool:
+        init_db_pool()  # Try to reinitialize if pool is None
+        if not db_pool:
+            return None
+            
+    try:
+        return db_pool.get_connection()
+    except Exception as e:
+        logger.error(f"Failed to get connection from pool: {e}")
+        return None
 
 class ModelCache:
-    """In-memory cache for loaded models"""
+    """In-memory cache for loaded models with TTL"""
     _instance = None
-    _cache: Dict[Tuple[str, str], Tuple[tf.keras.Model, object, list]] = {}
+    _cache: Dict[Tuple[str, str], Tuple[tf.keras.Model, object, list, float]] = {}
     _lock = threading.Lock()
 
     def __new__(cls):
@@ -205,17 +256,25 @@ class ModelCache:
 
     @classmethod
     def get(cls, client_id: str, model_type: str):
-        """Get cached model"""
+        """Get cached model if not expired"""
         key = (client_id or "global", model_type)
         with cls._lock:
-            return cls._cache.get(key)
+            if key in cls._cache:
+                model, tokenizer, labels, timestamp = cls._cache[key]
+                # Check if cache entry is still valid
+                if time.time() - timestamp < Config.CACHE_TIMEOUT:
+                    return model, tokenizer, labels
+                else:
+                    # Remove expired entry
+                    del cls._cache[key]
+            return None
 
     @classmethod
     def set(cls, client_id: str, model_type: str, model: tf.keras.Model, tokenizer: object, labels: list):
-        """Cache a model"""
+        """Cache a model with current timestamp"""
         key = (client_id or "global", model_type)
         with cls._lock:
-            cls._cache[key] = (model, tokenizer, labels)
+            cls._cache[key] = (model, tokenizer, labels, time.time())
 
     @classmethod
     def clear(cls):
@@ -224,7 +283,7 @@ class ModelCache:
             cls._cache.clear()
 
 def load_model_from_disk(client_id=None):
-    """Load model from disk files"""
+    """Load model from disk files with optimized loading"""
     try:
         model_files = Config.get_model_files(client_id)
         
@@ -232,9 +291,16 @@ def load_model_from_disk(client_id=None):
         if not all(os.path.exists(path) for path in model_files.values()):
             return None
         
-        # Load from disk
+        # Load from disk with optimized settings
         with tf.device('/cpu:0'):
-            model = tf.keras.models.load_model(model_files["model"], compile=False)
+            # Load model with optimized settings
+            model = tf.keras.models.load_model(
+                model_files["model"], 
+                compile=False,
+                options=tf.saved_model.LoadOptions(experimental_io_device='/job:localhost')
+            )
+            
+            # Load tokenizer and labels
             with open(model_files["tokenizer"], "rb") as f:
                 tokenizer = pickle.load(f)
             with open(model_files["labels"], "rb") as f:
@@ -245,8 +311,36 @@ def load_model_from_disk(client_id=None):
         logger.error(f"Error loading model from disk: {e}")
         return None
 
+def preload_models():
+    """Preload models on startup to reduce first request latency"""
+    logger.info("Preloading models...")
+    
+    # Get all client IDs from database
+    conn = get_db_connection()
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT user_token FROM chatbot_intents WHERE user_token IS NOT NULL")
+            client_ids = [row[0] for row in cursor.fetchall()]
+            client_ids.append(None)  # Add global model
+            
+            # Preload each model
+            for client_id in client_ids[:5]:  # Limit to first 5 to avoid overload
+                try:
+                    ensure_model_loaded(client_id)
+                    logger.info(f"Preloaded model for client: {client_id or 'global'}")
+                except Exception as e:
+                    logger.error(f"Failed to preload model for {client_id}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error getting client IDs for preloading: {e}")
+        finally:
+            conn.close()
+    
+    logger.info("Model preloading completed")
+
 def ensure_model_loaded(client_id):
-    """Ensure model is loaded, try GCS first, then local disk"""
+    """Ensure model is loaded, try cache first, then disk, then GCS"""
     # Check if model is in cache
     cached = ModelCache.get(client_id or "global", "main")
     if cached:
@@ -275,8 +369,21 @@ def ensure_model_loaded(client_id):
     
     return None
 
+def clean_text(text):
+    """Clean and preprocess text for better prediction"""
+    if not text:
+        return ""
+    
+    # Remove extra whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    # Basic text normalization
+    text = re.sub(r'[^\w\s\?\.\!]', '', text)
+    
+    return text
+
 def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
-    """Predict intent from message"""
+    """Predict intent from message with optimized processing"""
     try:
         # Get model data
         model_data = ensure_model_loaded(client_id)
@@ -285,10 +392,16 @@ def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
         
         model, tokenizer, labels = model_data
         
-        # Process prediction
-        sequence = tokenizer.texts_to_sequences([msg.lower().strip()])
+        # Preprocess message
+        clean_msg = clean_text(msg.lower().strip())
+        
+        # Process prediction with batch optimization
+        sequence = tokenizer.texts_to_sequences([clean_msg])
+        if not sequence or not sequence[0]:
+            return "fallback", 0.0
+            
         padded = pad_sequences(sequence, maxlen=model.input_shape[1], padding='post')
-        prediction = model.predict(padded, verbose=0)
+        prediction = model.predict(padded, verbose=0, batch_size=1)
         
         confidence = float(np.max(prediction))
         intent = labels[np.argmax(prediction)]
@@ -297,7 +410,7 @@ def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
     except Exception as e:
         logger.error(f"Prediction error: {e}")
         return "error", 0.0
-    
+
 def _run_training(client_id, training_id):
     global training_in_progress
 
@@ -362,9 +475,41 @@ def _run_training(client_id, training_id):
     finally:
         training_in_progress = False
 
+def get_cached_response(intent, client_id):
+    """Get response from cache if available"""
+    cache_key = f"{client_id or 'global'}:{intent}"
+    with cache_lock:
+        cached_data = response_cache.get(cache_key)
+        if cached_data and time.time() - cached_data['timestamp'] < Config.CACHE_TIMEOUT:
+            return cached_data['response']
+    return None
+
+def cache_response(intent, client_id, response):
+    """Cache a response"""
+    cache_key = f"{client_id or 'global'}:{intent}"
+    with cache_lock:
+        # Implement simple LRU cache eviction if needed
+        if len(response_cache) >= Config.MAX_CACHE_SIZE:
+            # Remove oldest entry
+            oldest_key = min(response_cache.keys(), key=lambda k: response_cache[k]['timestamp'])
+            del response_cache[oldest_key]
+            
+        response_cache[cache_key] = {
+            'response': response,
+            'timestamp': time.time()
+        }
 
 def get_response(intent, client_id=None):
-    """Get response for intent with improved error handling"""
+    """Get response for intent with improved error handling and caching"""
+    # Check cache first
+    cached_response = get_cached_response(intent, client_id)
+    if cached_response:
+        return {
+            "response": cached_response,
+            "status": "success",
+            "source": "cache"
+        }
+    
     conn = None
     try:
         conn = get_db_connection()
@@ -400,24 +545,28 @@ def get_response(intent, client_id=None):
         params.append((intent,))
 
         response = None
+        source = None
         with conn.cursor(dictionary=True) as cursor:
-            for query, param in zip(queries, params):
+            for i, (query, param) in enumerate(zip(queries, params)):
                 try:
                     cursor.execute(query, param)
                     if result := cursor.fetchone():
                         responses = json.loads(result["responses"])
                         response = random.choice(responses)
-                        logger.info(f"Found response for intent '{intent}'")
+                        source = "client" if i == 0 else "global"
+                        logger.info(f"Found response for intent '{intent}' from {source}")
                         break
                 except Exception as e:
                     logger.warning(f"Query failed: {query} with params {param}. Error: {str(e)}")
                     continue
 
         if response:
+            # Cache the response
+            cache_response(intent, client_id, response)
             return {
                 "response": response,
                 "status": "success",
-                "source": "client" if client_id and query == queries[0] else "global"
+                "source": source
             }
         
         logger.warning(f"No response found for intent: {intent}")
@@ -448,9 +597,45 @@ def get_response(intent, client_id=None):
             except Exception as e:
                 logger.warning(f"Error closing connection: {str(e)}")
 
+def compress_response(f):
+    """Decorator to compress responses with gzip"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        response = f(*args, **kwargs)
+        
+        # Check if client supports gzip
+        accept_encoding = request.headers.get('Accept-Encoding', '')
+        if 'gzip' not in accept_encoding.lower():
+            return response
+        
+        # Compress response data
+        if response.status_code == 200 and response.content_length > 500:  # Only compress larger responses
+            compressed_data = gzip.compress(response.get_data())
+            response.set_data(compressed_data)
+            response.headers['Content-Encoding'] = 'gzip'
+            response.headers['Content-Length'] = len(compressed_data)
+        
+        return response
+    return decorated_function
+
+@app.before_request
+def before_request():
+    """Measure request timing"""
+    request.start_time = time.time()
+
+@app.after_request
+def after_request(response):
+    """Log request timing"""
+    if hasattr(request, 'start_time'):
+        duration = time.time() - request.start_time
+        logger.info(f"Request {request.method} {request.path} took {duration:.3f}s")
+        response.headers['X-Response-Time'] = f'{duration:.3f}s'
+    return response
+
 @app.route("/predict", methods=["POST", "OPTIONS"])
+@compress_response
 def predict():
-    """Prediction endpoint"""
+    """Prediction endpoint with optimized response"""
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
     
@@ -478,6 +663,7 @@ def predict():
                 "message": "Message cannot be empty"
             }), 400
             
+        # Start prediction
         intent, confidence = predict_intent(msg, client_id)
         
         if confidence < Config.MIN_CONFIDENCE:
@@ -502,7 +688,6 @@ def predict():
             "error": "Internal Server Error",
             "message": "Failed to process request"
         }), 500
-    
 
 @app.route("/train", methods=["POST", "OPTIONS"])
 def start_training():
@@ -925,7 +1110,6 @@ def check_filesystem():
             "error": str(e)
         }), 500
 
-
 @app.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint"""
@@ -958,6 +1142,52 @@ def health_check():
             "error": str(e)
         }), 500
 
+@app.route("/cache-stats", methods=["GET"])
+def cache_stats():
+    """Get cache statistics"""
+    with cache_lock:
+        cache_size = len(response_cache)
+        cache_keys = list(response_cache.keys())[:10]  # First 10 keys
+        
+    with ModelCache._lock:
+        model_cache_size = len(ModelCache._cache)
+        model_cache_keys = list(ModelCache._cache.keys())[:5]  # First 5 keys
+    
+    return jsonify({
+        "response_cache": {
+            "size": cache_size,
+            "sample_keys": cache_keys
+        },
+        "model_cache": {
+            "size": model_cache_size,
+            "sample_keys": model_cache_keys
+        }
+    })
+
+@app.route("/clear-cache", methods=["POST"])
+def clear_cache():
+    """Clear all caches"""
+    with cache_lock:
+        response_cache.clear()
+    
+    ModelCache.clear()
+    
+    return jsonify({
+        "status": "success",
+        "message": "All caches cleared"
+    })
+
+# Preload models on startup
+@app.before_first_request
+def startup():
+    """Initialize application on first request"""
+    logger.info("Starting application initialization...")
+    # Preload models in background thread
+    threading.Thread(target=preload_models, daemon=True).start()
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    # Use a production WSGI server instead of Flask's development server
+    from waitress import serve
+    logger.info(f"Starting server on port {port}")
+    serve(app, host="0.0.0.0", port=port, threads=10)
