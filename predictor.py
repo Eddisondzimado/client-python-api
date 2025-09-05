@@ -54,9 +54,6 @@ except ImportError:
     logger.warning("Google Cloud Storage libraries not available")
     GCS_AVAILABLE = False
 
-# Thread pool for async operations
-thread_pool = None
-
 class Config:
     """Application configuration"""
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -132,16 +129,6 @@ def init_db_pool():
     except Exception as e:
         logger.error(f"Failed to initialize database pool: {e}")
         db_pool = None
-
-# Initialize DB pool on startup
-init_db_pool()
-
-def init_thread_pool():
-    """Initialize thread pool for async operations"""
-    global thread_pool
-    thread_pool = threading.BoundedSemaphore(Config.MODEL_PRELOAD_WORKERS)
-
-init_thread_pool()
 
 class GoogleCloudStorageManager:
     def __init__(self):
@@ -296,8 +283,7 @@ def load_model_from_disk(client_id=None):
             # Load model with optimized settings
             model = tf.keras.models.load_model(
                 model_files["model"], 
-                compile=False,
-                options=tf.saved_model.LoadOptions(experimental_io_device='/job:localhost')
+                compile=False
             )
             
             # Load tokenizer and labels
@@ -325,7 +311,7 @@ def preload_models():
             client_ids.append(None)  # Add global model
             
             # Preload each model
-            for client_id in client_ids[:5]:  # Limit to first 5 to avoid overload
+            for client_id in client_ids[:3]:  # Limit to first 3 to avoid overload
                 try:
                     ensure_model_loaded(client_id)
                     logger.info(f"Preloaded model for client: {client_id or 'global'}")
@@ -335,7 +321,8 @@ def preload_models():
         except Exception as e:
             logger.error(f"Error getting client IDs for preloading: {e}")
         finally:
-            conn.close()
+            if conn.is_connected():
+                conn.close()
     
     logger.info("Model preloading completed")
 
@@ -1072,7 +1059,7 @@ def get_training_logs():
             "error": str(e)
         }), 500
 
-@app.route("/check-filesystem", methods=["GET"])
+@app.route("/check-filesystem", methods["GET"])
 def check_filesystem():
     """Check the filesystem structure"""
     try:
@@ -1177,17 +1164,34 @@ def clear_cache():
         "message": "All caches cleared"
     })
 
-# Preload models on startup
-@app.before_first_request
-def startup():
-    """Initialize application on first request"""
+# Initialize the application
+def initialize_app():
+    """Initialize the application asynchronously"""
     logger.info("Starting application initialization...")
-    # Preload models in background thread
-    threading.Thread(target=preload_models, daemon=True).start()
+    
+    # Initialize database pool
+    init_db_pool()
+    
+    # Start model preloading in background
+    def preload_models_async():
+        try:
+            time.sleep(2)  # Wait a bit for server to start
+            preload_models()
+        except Exception as e:
+            logger.error(f"Model preloading failed: {e}")
+    
+    # Start preloading in background thread
+    preload_thread = threading.Thread(target=preload_models_async, daemon=True)
+    preload_thread.start()
+    
+    logger.info("Application initialization completed")
+
+# Initialize the app
+initialize_app()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
-    # Use a production WSGI server instead of Flask's development server
-    from waitress import serve
+    
+    # For Google Cloud Run, use this simple server
     logger.info(f"Starting server on port {port}")
-    serve(app, host="0.0.0.0", port=port, threads=10)
+    app.run(host="0.0.0.0", port=port, threaded=True)

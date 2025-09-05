@@ -30,7 +30,7 @@ steps:
     - '--set-env-vars=DB_HOST=104.243.44.92'
     - '--set-env-vars=DB_NAME=eddcode1_aidexchatbot'
     - '--set-env-vars=DB_USER=eddcode1_talkbot'
-    - '--set-env-vars=DB_PASS=ZS.nxgC^&9%Bc4E8'
+    - '--set-env-vars=DB_PASS=sxhrfydhtd57465rd'
     - '--set-env-vars=DB_PORT=3306'
 
 substitutions:

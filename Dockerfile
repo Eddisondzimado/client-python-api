@@ -3,10 +3,12 @@ FROM python:3.9-slim
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies including MySQL client libraries
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
+    default-libmysqlclient-dev \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
@@ -26,5 +28,5 @@ EXPOSE 8080
 ENV PORT=8080
 ENV GCS_BUCKET_NAME=client-support-chatbot-api.appspot.com
 
-# Run the application
-CMD ["python", "predictor.py"]
+# Use a lightweight server and start immediately
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--threads", "4", "--timeout", "60", "predictor:app"]
