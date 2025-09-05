@@ -1,3 +1,4 @@
+
 import os
 import json
 import pickle
@@ -21,6 +22,7 @@ import base64
 import re
 import gzip
 from functools import wraps
+import traceback
 
 # Configure logging
 logging.basicConfig(
@@ -71,8 +73,8 @@ class Config:
     DB_POOL_SIZE = int(os.environ.get('DB_POOL_SIZE', 5))
     DB_POOL_RECYCLE = int(os.environ.get('DB_POOL_RECYCLE', 3600))
     
-    # GCS configuration - UPDATED with your bucket name
-    GCS_BUCKET_NAME = os.environ.get('GCS_BUCKET_NAME', 'client-support-chatbot-api.appspot.com')
+    # GCS configuration
+    GCS_BUCKET_NAME = os.environ.get('GCS_BUCKET_NAME', 'client-chatbot-api-models')
     
     # Cache configuration
     CACHE_TIMEOUT = int(os.environ.get('CACHE_TIMEOUT', 300))  # 5 minutes
@@ -111,7 +113,7 @@ response_cache = {}
 cache_lock = threading.Lock()
 
 def init_db_pool():
-    """Initialize database connection pool with proper MySQL 8+ configuration"""
+    """Initialize database connection pool"""
     global db_pool
     try:
         db_pool = mysql.connector.pooling.MySQLConnectionPool(
@@ -125,21 +127,47 @@ def init_db_pool():
             port=Config.DB_PORT,
             connection_timeout=5,
             connect_timeout=5,
-            auth_plugin='mysql_native_password',  # Important for MySQL 8+
-            autocommit=True,
-            use_pure=True  # Use pure Python implementation for better compatibility
+            auth_plugin='mysql_native_password',
+            autocommit=True
         )
         logger.info(f"Database connection pool initialized with {Config.DB_POOL_SIZE} connections")
         return True
     except mysql.connector.Error as err:
-        logger.error(f"MySQL Error initializing pool: {err}")
-        logger.error(f"Error code: {err.errno}, SQL state: {err.sqlstate}")
+        logger.error(f"MySQL Error: {err}")
         return False
     except Exception as e:
         logger.error(f"Failed to initialize database pool: {e}")
         return False
 
-def test_db_connection_direct():
+def get_db_connection():
+    """Get database connection from pool with retry logic"""
+    global db_pool
+    
+    # If pool doesn't exist, try to initialize it
+    if db_pool is None:
+        if not init_db_pool():
+            return None
+    
+    try:
+        connection = db_pool.get_connection()
+        if connection.is_connected():
+            return connection
+        else:
+            logger.error("Got connection from pool but it's not connected")
+            return None
+    except mysql.connector.Error as err:
+        logger.error(f"MySQL Error getting connection: {err}")
+        # Try to reinitialize pool on error
+        try:
+            init_db_pool()
+            return db_pool.get_connection() if db_pool else None
+        except:
+            return None
+    except Exception as e:
+        logger.error(f"Failed to get connection from pool: {e}")
+        return None
+
+def test_db_connection():
     """Test database connection directly (bypass pool)"""
     try:
         connection = mysql.connector.connect(
@@ -149,55 +177,18 @@ def test_db_connection_direct():
             password=Config.DB_PASS,
             port=Config.DB_PORT,
             connection_timeout=5,
-            auth_plugin='mysql_native_password',
-            use_pure=True
+            auth_plugin='mysql_native_password'
         )
         if connection.is_connected():
-            db_info = connection.get_server_info()
-            logger.info(f"Direct database connection successful. MySQL server version: {db_info}")
             connection.close()
             return True
         return False
     except mysql.connector.Error as err:
-        logger.error(f"MySQL Direct Connection Error: {err}")
-        logger.error(f"Error code: {err.errno}, SQL state: {err.sqlstate}")
+        logger.error(f"MySQL Connection Test Error: {err}")
         return False
     except Exception as e:
-        logger.error(f"Direct database connection test failed: {e}")
+        logger.error(f"Database connection test failed: {e}")
         return False
-
-def get_db_connection():
-    """Get database connection from pool with retry logic"""
-    global db_pool
-    
-    max_retries = 2
-    for attempt in range(max_retries):
-        try:
-            if db_pool is None:
-                if not init_db_pool():
-                    return None
-            
-            connection = db_pool.get_connection()
-            if connection.is_connected():
-                return connection
-            else:
-                logger.warning(f"Got connection from pool but it's not connected (attempt {attempt + 1})")
-                
-        except mysql.connector.Error as err:
-            logger.error(f"MySQL Error getting connection (attempt {attempt + 1}): {err}")
-            # Reinitialize pool on error
-            if attempt == max_retries - 1:  # Last attempt
-                logger.error("All connection attempts failed")
-                return None
-            time.sleep(0.5)  # Wait before retry
-            
-        except Exception as e:
-            logger.error(f"Failed to get connection from pool (attempt {attempt + 1}): {e}")
-            if attempt == max_retries - 1:  # Last attempt
-                return None
-            time.sleep(0.5)  # Wait before retry
-    
-    return None
 
 class GoogleCloudStorageManager:
     def __init__(self):
@@ -228,7 +219,7 @@ class GoogleCloudStorageManager:
                 # Use default credentials (when running on Google Cloud)
                 self.client = storage.Client()
             
-            # Get bucket - USING YOUR BUCKET NAME
+            # Get bucket
             self.bucket = self.client.bucket(Config.GCS_BUCKET_NAME)
             if not self.bucket.exists():
                 logger.warning(f"Bucket {Config.GCS_BUCKET_NAME} does not exist")
@@ -332,6 +323,7 @@ def load_model_from_disk(client_id=None):
         
         # Check if all files exist
         if not all(os.path.exists(path) for path in model_files.values()):
+            logger.warning(f"Model files not found for client {client_id}")
             return None
         
         # Load from disk with optimized settings
@@ -348,9 +340,11 @@ def load_model_from_disk(client_id=None):
             with open(model_files["labels"], "rb") as f:
                 labels = pickle.load(f)
         
+        logger.info(f"Successfully loaded model for client {client_id}")
         return model, tokenizer, labels
     except Exception as e:
         logger.error(f"Error loading model from disk: {e}")
+        logger.error(traceback.format_exc())
         return None
 
 def preload_models():
@@ -378,9 +372,12 @@ def preload_models():
             logger.error(f"Error getting client IDs for preloading: {e}")
         finally:
             if conn and conn.is_connected():
-                conn.close()
+                try:
+                    conn.close()
+                except Exception as e:
+                    logger.warning(f"Error closing connection: {str(e)}")
     else:
-        logger.warning("Skipping model preloading - no database connection")
+        logger.warning("Cannot preload models - database connection failed")
     
     logger.info("Model preloading completed")
 
@@ -433,6 +430,7 @@ def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
         # Get model data
         model_data = ensure_model_loaded(client_id)
         if not model_data:
+            logger.error(f"No model data found for client {client_id}")
             return "fallback", 0.0
         
         model, tokenizer, labels = model_data
@@ -454,6 +452,7 @@ def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
         
     except Exception as e:
         logger.error(f"Prediction error: {e}")
+        logger.error(traceback.format_exc())
         return "error", 0.0
 
 def _run_training(client_id, training_id):
@@ -677,6 +676,28 @@ def after_request(response):
         response.headers['X-Response-Time'] = f'{duration:.3f}s'
     return response
 
+@app.errorhandler(500)
+def handle_500_error(e):
+    """Handle 500 errors with detailed logging"""
+    logger.error(f"500 Error: {str(e)}")
+    logger.error(traceback.format_exc())
+    return jsonify({
+        "error": "Internal Server Error",
+        "message": "The server encountered an internal error",
+        "status": 500
+    }), 500
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    """Handle any unhandled exceptions"""
+    logger.error(f"Unhandled exception: {str(e)}")
+    logger.error(traceback.format_exc())
+    return jsonify({
+        "error": "Internal Server Error",
+        "message": "An unexpected error occurred",
+        "status": 500
+    }), 500
+
 @app.route("/predict", methods=["POST", "OPTIONS"])
 @compress_response
 def predict():
@@ -708,6 +729,8 @@ def predict():
                 "message": "Message cannot be empty"
             }), 400
             
+        logger.info(f"Received prediction request: '{msg}' for client: {client_id}")
+            
         # Start prediction
         intent, confidence = predict_intent(msg, client_id)
         
@@ -729,6 +752,7 @@ def predict():
 
     except Exception as e:
         logger.error(f"Prediction error: {str(e)}")
+        logger.error(traceback.format_exc())
         return jsonify({
             "error": "Internal Server Error",
             "message": "Failed to process request"
@@ -1116,6 +1140,7 @@ def get_training_logs():
             "status": "error",
             "error": str(e)
         }), 500
+
 
 @app.route("/health", methods=["GET"])
 def health_check():
