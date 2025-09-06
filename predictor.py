@@ -602,17 +602,9 @@ def get_cached_response(intent, client_id):
             return cached_data['response']
     return None
 
+
 def get_response(intent, client_id=None):
-    """Get response for intent with improved error handling and caching"""
-    # Check cache first
-    cached_response = get_cached_response(intent, client_id)
-    if cached_response:
-        return {
-            "response": cached_response,
-            "status": "success",
-            "source": "cache"
-        }
-    
+    """Get response for intent with improved error handling"""
     conn = None
     try:
         conn = get_db_connection()
@@ -648,28 +640,24 @@ def get_response(intent, client_id=None):
         params.append((intent,))
 
         response = None
-        source = None
         with conn.cursor(dictionary=True) as cursor:
-            for i, (query, param) in enumerate(zip(queries, params)):
+            for query, param in zip(queries, params):
                 try:
                     cursor.execute(query, param)
                     if result := cursor.fetchone():
                         responses = json.loads(result["responses"])
                         response = random.choice(responses)
-                        source = "client" if i == 0 else "global"
-                        logger.info(f"Found response for intent '{intent}' from {source}")
+                        logger.info(f"Found response for intent '{intent}'")
                         break
                 except Exception as e:
                     logger.warning(f"Query failed: {query} with params {param}. Error: {str(e)}")
                     continue
 
         if response:
-            # Cache the response
-            cache_response(intent, client_id, response)
             return {
                 "response": response,
                 "status": "success",
-                "source": source
+                "source": "client" if client_id and query == queries[0] else "global"
             }
         
         logger.warning(f"No response found for intent: {intent}")
@@ -703,65 +691,36 @@ def get_response(intent, client_id=None):
 
 @app.route("/predict", methods=["POST", "OPTIONS"])
 def predict():
-    """Prediction endpoint with support for JSON and form-data"""
+    """Prediction endpoint"""
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
-
-    content_type = request.content_type or ''
-    logger.info(f"Incoming request Content-Type: {content_type}")
-
+    
+    # Check Content-Type header
+    if request.content_type != 'application/json':
+        return jsonify({
+            "error": "Unsupported Media Type",
+            "message": "Content-Type must be application/json"
+        }), 415
+    
     try:
-        # Parse request data depending on content type
-        data = {}
-
-        if 'application/json' in content_type:
-            data = request.get_json(force=True, silent=True) or {}
-        elif 'multipart/form-data' in content_type:
-            data = {
-                "msg": request.form.get("msg", ""),
-                "clientId": request.form.get("clientId")
-            }
-        else:
-            # fallback if raw body JSON but no content-type
-            if request.get_data():
-                try:
-                    data = request.get_json(force=True) or {}
-                except Exception:
-                    pass
-
-        # Validation: must have message
-        msg = (data.get("msg") or "").strip()
-        client_id = data.get("clientId")
-
-        if not msg:
+        data = request.get_json()
+        if not data:
             return jsonify({
                 "error": "Bad Request",
+                "message": "No JSON data received"
+            }), 400
+            
+        msg = data.get("msg", "").strip()
+        client_id = data.get("clientId")
+        
+        if not msg:
+            return jsonify({
+                "error": "Bad Request", 
                 "message": "Message cannot be empty"
             }), 400
-
-        logger.info(f"Received prediction request: '{msg}' for client: {client_id}")
-
-        # Debug: Check if model files exist
-        model_files = Config.get_model_files(client_id)
-        for file_type, file_path in model_files.items():
-            exists = os.path.exists(file_path)
-            logger.info(f"Model file {file_type}: {file_path} - Exists: {exists}")
-            if exists:
-                logger.info(f"File size: {os.path.getsize(file_path)} bytes")
-
-        # Run prediction
-        try:
-            intent, confidence = predict_intent(msg, client_id)
-        except Exception as e:
-            logger.error(f"Prediction failed: {str(e)}", exc_info=True)
-            return jsonify({
-                "response": "I'm having trouble processing your request right now. Please try again.",
-                "intent": "fallback",
-                "confidence": 0.0,
-                "status": "service_error"
-            })
-
-        # Handle low confidence
+            
+        intent, confidence = predict_intent(msg, client_id)
+        
         if confidence < Config.MIN_CONFIDENCE:
             return jsonify({
                 "response": "I'm not quite sure what you mean. Could you rephrase?",
@@ -770,30 +729,19 @@ def predict():
                 "status": "low_confidence"
             })
 
-        # Get response from database
-        try:
-            response = get_response(intent, client_id)
-            return jsonify({
-                "response": response["response"],
-                "intent": intent,
-                "confidence": round(confidence, 2),
-                "status": response["status"]
-            })
-        except Exception as e:
-            logger.error(f"Response lookup failed: {str(e)}", exc_info=True)
-            return jsonify({
-                "response": "I understand what you're asking, but I'm having trouble retrieving the response.",
-                "intent": intent,
-                "confidence": round(confidence, 2),
-                "status": "response_error"
-            })
+        response = get_response(intent, client_id)
+        return jsonify({
+            "response": response["response"],
+            "intent": intent,
+            "confidence": round(confidence, 2),
+            "status": response["status"]
+        })
 
     except Exception as e:
-        logger.error(f"Unexpected error in predict endpoint: {str(e)}", exc_info=True)
+        logger.error(f"Prediction error: {str(e)}")
         return jsonify({
             "error": "Internal Server Error",
-            "message": "Failed to process request",
-            "status": 500
+            "message": "Failed to process request"
         }), 500
 
 
@@ -1096,52 +1044,52 @@ def check_data():
         if conn and conn.is_connected():
             conn.close()
 
-@app.route("/gcs-status", methods=["GET"])
-def check_gcs_status():
-    """Check Google Cloud Storage status"""
-    try:
-        if not gcs_manager:
-            return jsonify({
-                "status": "error",
-                "message": "Google Cloud Storage manager not initialized",
-                "gcs_configured": False,
-                "gcs_enabled": False
-            }), 500
+# @app.route("/gcs-status", methods=["GET"])
+# def check_gcs_status():
+#     """Check Google Cloud Storage status"""
+#     try:
+#         if not gcs_manager:
+#             return jsonify({
+#                 "status": "error",
+#                 "message": "Google Cloud Storage manager not initialized",
+#                 "gcs_configured": False,
+#                 "gcs_enabled": False
+#             }), 500
         
-        if not gcs_manager.enabled:
-            return jsonify({
-                "status": "error",
-                "message": "Google Cloud Storage not enabled",
-                "gcs_configured": bool(Config.GCS_BUCKET_NAME),
-                "gcs_enabled": False
-            }), 500
+#         if not gcs_manager.enabled:
+#             return jsonify({
+#                 "status": "error",
+#                 "message": "Google Cloud Storage not enabled",
+#                 "gcs_configured": bool(Config.GCS_BUCKET_NAME),
+#                 "gcs_enabled": False
+#             }), 500
         
-        # Test connectivity
-        try:
-            # Try to list a few files to test connectivity
-            blobs = list(gcs_manager.client.list_blobs(gcs_manager.bucket, max_results=1))
-            connected = True
-            error_msg = None
-        except Exception as e:
-            connected = False
-            error_msg = str(e)
+#         # Test connectivity
+#         try:
+#             # Try to list a few files to test connectivity
+#             blobs = list(gcs_manager.client.list_blobs(gcs_manager.bucket, max_results=1))
+#             connected = True
+#             error_msg = None
+#         except Exception as e:
+#             connected = False
+#             error_msg = str(e)
         
-        return jsonify({
-            "status": "success" if connected else "error",
-            "gcs_configured": True,
-            "gcs_enabled": True,
-            "gcs_connected": connected,
-            "bucket_name": Config.GCS_BUCKET_NAME,
-            "error": error_msg if not connected else None
-        })
+#         return jsonify({
+#             "status": "success" if connected else "error",
+#             "gcs_configured": True,
+#             "gcs_enabled": True,
+#             "gcs_connected": connected,
+#             "bucket_name": Config.GCS_BUCKET_NAME,
+#             "error": error_msg if not connected else None
+#         })
         
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": f"GCS status check failed: {str(e)}",
-            "gcs_configured": bool(Config.GCS_BUCKET_NAME),
-            "gcs_enabled": False
-        }), 500
+#     except Exception as e:
+#         return jsonify({
+#             "status": "error",
+#             "message": f"GCS status check failed: {str(e)}",
+#             "gcs_configured": bool(Config.GCS_BUCKET_NAME),
+#             "gcs_enabled": False
+#         }), 500
 
 @app.route("/training-logs", methods=["GET"])
 def get_training_logs():
