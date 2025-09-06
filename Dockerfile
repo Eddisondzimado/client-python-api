@@ -29,4 +29,4 @@ ENV PORT=8080
 ENV GCS_BUCKET_NAME=client-support-chatbot-api.appspot.com
 
 # Use a lightweight server and start immediately
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--threads", "4", "--timeout", "60", "predictor:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--threads", "4", "--timeout", "3600", "predictor:app"]
