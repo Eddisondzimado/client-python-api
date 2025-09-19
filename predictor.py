@@ -441,9 +441,8 @@ def clean_text(text):
     
     return text
 
-def cache_response(intent, client_id, response):
-    """Cache a response"""
-    cache_key = f"{client_id or 'global'}:{intent}"
+def cache_response(cache_key, response_data):
+    """Cache a response by cache key"""
     with cache_lock:
         # Implement simple LRU cache eviction if needed
         if len(response_cache) >= Config.MAX_CACHE_SIZE:
@@ -452,10 +451,17 @@ def cache_response(intent, client_id, response):
             del response_cache[oldest_key]
             
         response_cache[cache_key] = {
-            'response': response,
+            'data': response_data,
             'timestamp': time.time()
         }
 
+def get_cached_response(cache_key):
+    """Get response from cache by cache key"""
+    with cache_lock:
+        cached_data = response_cache.get(cache_key)
+        if cached_data and time.time() - cached_data['timestamp'] < Config.CACHE_TIMEOUT:
+            return cached_data
+    return None
 
 def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
     """Predict intent from message with optimized processing"""
@@ -611,7 +617,7 @@ def get_response(intent, client_id=None):
         if not conn:
             logger.error("Failed to establish database connection")
             return {
-                "response": "I'm having connection issues. Please try again later.",
+                "response": "Sorry, I'm having connection issues. Please try again later.",
                 "status": "db_error",
                 "error": "Database connection failed"
             }
@@ -688,7 +694,6 @@ def get_response(intent, client_id=None):
             except Exception as e:
                 logger.warning(f"Error closing connection: {str(e)}")
 
-
 @app.route("/predict", methods=["POST", "OPTIONS"])
 def predict():
     """Prediction endpoint"""
@@ -719,14 +724,21 @@ def predict():
                 "message": "Message cannot be empty"
             }), 400
         
-        # Check cache first (if implemented)
-        cache_key = f"{client_id or 'global'}:{msg}"
-        cached_response = get_cached_response(cache_key)  # You'd need to implement this
+        # Check cache first by intent (after prediction)
+        intent, confidence = predict_intent(msg, client_id)
+        
+        # Check if we have a cached response for this intent
+        cached_response = get_cached_response(intent, client_id)
         
         if cached_response:
-            return jsonify(cached_response)
-            
-        intent, confidence = predict_intent(msg, client_id)
+            response_data = {
+                "response": cached_response,
+                "intent": intent,
+                "confidence": round(confidence, 2),
+                "status": "success",
+                "source": "cache"
+            }
+            return jsonify(response_data)
         
         if confidence < Config.MIN_CONFIDENCE:
             response_data = {
@@ -735,8 +747,6 @@ def predict():
                 "confidence": round(confidence, 2),
                 "status": "low_confidence"
             }
-            # Cache this response
-            cache_response(cache_key, response_data)
             return jsonify(response_data)
 
         response_result = get_response(intent, client_id)
@@ -759,9 +769,9 @@ def predict():
                 "source": response_result.get("source")
             }
         
-        # Cache successful responses
+        # Cache successful responses by intent
         if response_data["status"] == "success":
-            cache_response(cache_key, response_data)
+            cache_response(intent, client_id, response_result["response"])
             
         return jsonify(response_data)
 
