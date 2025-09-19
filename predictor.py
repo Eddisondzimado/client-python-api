@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Configure TensorFlow for optimized performance
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+osviron['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 tf.get_logger().setLevel('ERROR')
 os.makedirs('data/models', exist_ok=True)
 
@@ -441,7 +441,7 @@ def clean_text(text):
     
     return text
 
-def cache_response(cache_key, response_data):
+def cache_response_by_key(cache_key, response_data):
     """Cache a response by cache key"""
     with cache_lock:
         # Implement simple LRU cache eviction if needed
@@ -455,12 +455,36 @@ def cache_response(cache_key, response_data):
             'timestamp': time.time()
         }
 
-def get_cached_response(cache_key):
+def get_cached_response_by_key(cache_key):
     """Get response from cache by cache key"""
     with cache_lock:
         cached_data = response_cache.get(cache_key)
         if cached_data and time.time() - cached_data['timestamp'] < Config.CACHE_TIMEOUT:
-            return cached_data
+            return cached_data['data']
+    return None
+
+def cache_response_by_intent(intent, client_id, response):
+    """Cache a response by intent"""
+    cache_key = f"{client_id or 'global'}:{intent}"
+    with cache_lock:
+        # Implement simple LRU cache eviction if needed
+        if len(response_cache) >= Config.MAX_CACHE_SIZE:
+            # Remove oldest entry
+            oldest_key = min(response_cache.keys(), key=lambda k: response_cache[k]['timestamp'])
+            del response_cache[oldest_key]
+            
+        response_cache[cache_key] = {
+            'response': response,
+            'timestamp': time.time()
+        }
+
+def get_cached_response_by_intent(intent, client_id):
+    """Get response from cache by intent"""
+    cache_key = f"{client_id or 'global'}:{intent}"
+    with cache_lock:
+        cached_data = response_cache.get(cache_key)
+        if cached_data and time.time() - cached_data['timestamp'] < Config.CACHE_TIMEOUT:
+            return cached_data['response']
     return None
 
 def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
@@ -599,16 +623,6 @@ def _run_training(client_id, training_id):
     finally:
         training_in_progress = False
 
-def get_cached_response(intent, client_id):
-    """Get response from cache if available"""
-    cache_key = f"{client_id or 'global'}:{intent}"
-    with cache_lock:
-        cached_data = response_cache.get(cache_key)
-        if cached_data and time.time() - cached_data['timestamp'] < Config.CACHE_TIMEOUT:
-            return cached_data['response']
-    return None
-
-
 def get_response(intent, client_id=None):
     """Get response for intent with improved error handling"""
     conn = None
@@ -728,7 +742,7 @@ def predict():
         intent, confidence = predict_intent(msg, client_id)
         
         # Check if we have a cached response for this intent
-        cached_response = get_cached_response(intent, client_id)
+        cached_response = get_cached_response_by_intent(intent, client_id)
         
         if cached_response:
             response_data = {
@@ -771,7 +785,7 @@ def predict():
         
         # Cache successful responses by intent
         if response_data["status"] == "success":
-            cache_response(intent, client_id, response_result["response"])
+            cache_response_by_intent(intent, client_id, response_result["response"])
             
         return jsonify(response_data)
 
@@ -851,7 +865,6 @@ def check_training_complete():
                 "last_training_time": datetime.now().isoformat() if not training_in_progress else None
             }
         })
-
 @app.route("/check-models", methods=["GET"])
 def check_models():
     """Enhanced model verification endpoint that checks both local and GCS"""
