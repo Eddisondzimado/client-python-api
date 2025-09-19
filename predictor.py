@@ -718,32 +718,60 @@ def predict():
                 "error": "Bad Request", 
                 "message": "Message cannot be empty"
             }), 400
+        
+        # Check cache first (if implemented)
+        cache_key = f"{client_id or 'global'}:{msg}"
+        cached_response = get_cached_response(cache_key)  # You'd need to implement this
+        
+        if cached_response:
+            return jsonify(cached_response)
             
         intent, confidence = predict_intent(msg, client_id)
         
         if confidence < Config.MIN_CONFIDENCE:
-            return jsonify({
+            response_data = {
                 "response": "I'm not quite sure what you mean. Could you rephrase?",
                 "intent": intent,
                 "confidence": round(confidence, 2),
                 "status": "low_confidence"
-            })
+            }
+            # Cache this response
+            cache_response(cache_key, response_data)
+            return jsonify(response_data)
 
-        response = get_response(intent, client_id)
-        return jsonify({
-            "response": response["response"],
-            "intent": intent,
-            "confidence": round(confidence, 2),
-            "status": response["status"]
-        })
+        response_result = get_response(intent, client_id)
+        
+        # Handle case where get_response returns an error
+        if response_result.get("status") != "success":
+            response_data = {
+                "response": response_result["response"],
+                "intent": intent,
+                "confidence": round(confidence, 2),
+                "status": response_result["status"],
+                "error": response_result.get("error")
+            }
+        else:
+            response_data = {
+                "response": response_result["response"],
+                "intent": intent,
+                "confidence": round(confidence, 2),
+                "status": "success",
+                "source": response_result.get("source")
+            }
+        
+        # Cache successful responses
+        if response_data["status"] == "success":
+            cache_response(cache_key, response_data)
+            
+        return jsonify(response_data)
 
     except Exception as e:
         logger.error(f"Prediction error: {str(e)}")
+        logger.error(traceback.format_exc())
         return jsonify({
             "error": "Internal Server Error",
             "message": "Failed to process request"
         }), 500
-
 
 @app.route("/train", methods=["POST", "OPTIONS"])
 def start_training():
