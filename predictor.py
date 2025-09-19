@@ -456,7 +456,6 @@ def cache_response(intent, client_id, response):
             'timestamp': time.time()
         }
 
-
 def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
     """Predict intent from message with optimized processing"""
     try:
@@ -528,6 +527,7 @@ def predict_intent(msg: str, client_id: str = None) -> Tuple[str, float]:
         logger.error(f"Prediction error: {e}")
         logger.error(traceback.format_exc())
         return "error", 0.0
+
 
 def _run_training(client_id, training_id):
     global training_in_progress
@@ -691,7 +691,7 @@ def get_response(intent, client_id=None):
 
 @app.route("/predict", methods=["POST", "OPTIONS"])
 def predict():
-    """Prediction endpoint"""
+    """Prediction endpoint with optimized response"""
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
     
@@ -718,61 +718,69 @@ def predict():
                 "error": "Bad Request", 
                 "message": "Message cannot be empty"
             }), 400
-        
-        # Check cache first (if implemented)
-        cache_key = f"{client_id or 'global'}:{msg}"
-        cached_response = get_cached_response(cache_key)  # You'd need to implement this
-        
-        if cached_response:
-            return jsonify(cached_response)
             
-        intent, confidence = predict_intent(msg, client_id)
+        logger.info(f"Received prediction request: '{msg}' for client: {client_id}")
+        
+        # Debug: Check if model files exist
+        model_files = Config.get_model_files(client_id)
+        logger.info(f"Looking for model files: {model_files}")
+        
+        for file_type, file_path in model_files.items():
+            exists = os.path.exists(file_path)
+            logger.info(f"Model file {file_type}: {file_path} - Exists: {exists}")
+            if exists:
+                logger.info(f"File size: {os.path.getsize(file_path) if exists else 0} bytes")
+            
+        # Start prediction - with detailed error handling
+        try:
+            intent, confidence = predict_intent(msg, client_id)
+        except Exception as e:
+            logger.error(f"Prediction failed: {str(e)}")
+            logger.error(traceback.format_exc())
+            # Return a fallback response instead of crashing
+            return jsonify({
+                "response": "I'm having trouble processing your request right now. Please try again.",
+                "intent": "fallback",
+                "confidence": 0.0,
+                "status": "service_error"
+            })
         
         if confidence < Config.MIN_CONFIDENCE:
-            response_data = {
+            return jsonify({
                 "response": "I'm not quite sure what you mean. Could you rephrase?",
                 "intent": intent,
                 "confidence": round(confidence, 2),
                 "status": "low_confidence"
-            }
-            # Cache this response
-            cache_response(cache_key, response_data)
-            return jsonify(response_data)
+            })
 
-        response_result = get_response(intent, client_id)
-        
-        # Handle case where get_response returns an error
-        if response_result.get("status") != "success":
-            response_data = {
-                "response": response_result["response"],
+        # Get response from database
+        try:
+            response = get_response(intent, client_id)
+            return jsonify({
+                "response": response["response"],
                 "intent": intent,
                 "confidence": round(confidence, 2),
-                "status": response_result["status"],
-                "error": response_result.get("error")
-            }
-        else:
-            response_data = {
-                "response": response_result["response"],
+                "status": response["status"]
+            })
+        except Exception as e:
+            logger.error(f"Response lookup failed: {str(e)}")
+            # Fallback response if database is unavailable
+            return jsonify({
+                "response": "I understand what you're asking, but I'm having trouble retrieving the response.",
                 "intent": intent,
                 "confidence": round(confidence, 2),
-                "status": "success",
-                "source": response_result.get("source")
-            }
-        
-        # Cache successful responses
-        if response_data["status"] == "success":
-            cache_response(cache_key, response_data)
-            
-        return jsonify(response_data)
+                "status": "response_error"
+            })
 
     except Exception as e:
-        logger.error(f"Prediction error: {str(e)}")
+        logger.error(f"Unexpected error in predict endpoint: {str(e)}")
         logger.error(traceback.format_exc())
         return jsonify({
             "error": "Internal Server Error",
-            "message": "Failed to process request"
+            "message": "Failed to process request",
+            "status": 500
         }), 500
-
+    
 @app.route("/train", methods=["POST", "OPTIONS"])
 def start_training():
     """Initiate training process with detailed responses"""
